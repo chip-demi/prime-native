@@ -971,3 +971,347 @@ async fn session_completion_lost_ack_never_resends_after_reopen() {
     );
     server.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_completion_background_turn_waits_for_continuation() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let (commands, server) = super::tests::fake_supervisor(&socket);
+    let assignment = json!({"customType":"rlm_session_assignment", "role":"custom", "content":"work",
+        "details":{"assignmentId":"background-task","artifactRef":"result.md",
+        "creatorSessionId":"creator","creatorSessionFile":"creator.jsonl","deliveryId":"background-delivery"}});
+    let engine = Arc::new(GateProbeEngine {
+        frames: vec![
+            EngineEvent::CustomMessage(assignment),
+            EngineEvent::AssistantMessage(json!({"role":"assistant","stopReason":"stop",
+                "content":[{"type":"text","text":"intermediate result"}]})),
+            EngineEvent::Done(Ok(())),
+        ],
+        background: true.into(),
+        ..Default::default()
+    });
+    let mut runner = burst_runner(engine.clone());
+    runner.passivation.link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
+    let mut store = SessionFile::create("/fixture", None, 0);
+    let path = dir.path().join("worker.jsonl");
+    store.set_path(path.clone());
+    store.rewrite().unwrap();
+    let session_id = store.session_id().to_string();
+    runner.core.lock().unwrap().store = Some(store);
+    runner
+        .run_turn(
+            engine.clone(),
+            Lane::Steering,
+            vec![QueuedItem {
+                message: "work".into(),
+                priority: QueuePriority::Human,
+                preview: None,
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                input_identity: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            }],
+        )
+        .await;
+    assert_eq!(engine.turns_done.load(Ordering::SeqCst), 1);
+    assert!(commands.lock().unwrap().is_empty());
+    engine.continuation_pending.store(true, Ordering::SeqCst);
+    engine.background.store(false, Ordering::SeqCst);
+    runner.deliver_session_completion().await;
+    assert!(commands.lock().unwrap().is_empty());
+    // A second scripted engine supplies the continuation on the same runner/session.
+    // No new assignment or user row is emitted by this continuation.
+    let continuation = Arc::new(GateProbeEngine {
+        frames: vec![
+            EngineEvent::AssistantMessage(json!({"role":"assistant","stopReason":"stop",
+            "content":[{"type":"text","text":"latest final result"}]})),
+            EngineEvent::Done(Ok(())),
+        ],
+        ..Default::default()
+    });
+    engine.continuation_pending.store(false, Ordering::SeqCst);
+    runner.engine = continuation.clone();
+    runner
+        .run_turn(
+            continuation.clone(),
+            Lane::Steering,
+            vec![QueuedItem {
+                message: "work".into(),
+                priority: QueuePriority::Human,
+                preview: None,
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                input_identity: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            }],
+        )
+        .await;
+    assert_eq!(continuation.turns_done.load(Ordering::SeqCst), 1);
+    runner.deliver_session_completion().await;
+    let rows = commands.lock().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["type"], "follow_up");
+    assert_eq!(rows[0]["activeSessionId"], "creator");
+    assert_eq!(rows[0]["queueKey"], "background-delivery");
+    let notice: Value = serde_json::from_str(
+        rows[0]["message"]
+            .as_str()
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(
+        notice,
+        json!({"assignmentId":"background-task","artifactRef":"result.md",
+        "deliveryId":"background-delivery","sessionId":session_id,"sessionFile":path.to_string_lossy(),
+        "status":"settled","stopReason":"stop","resultPreview":"latest final result","taskAccepted":false})
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_completion_error_turn_preserves_failure_and_never_accepts() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let (commands, server) = super::tests::fake_supervisor(&socket);
+    let engine = Arc::new(GateProbeEngine {
+        frames: vec![
+            EngineEvent::AssistantMessage(json!({"role":"assistant","stopReason":"error",
+            "content":[{"type":"text","text":"scripted failure"}]})),
+            EngineEvent::Done(Err("scripted failure".into())),
+        ],
+        ..Default::default()
+    });
+    let mut runner = burst_runner(engine.clone());
+    runner.passivation.link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
+    let path = dir.path().join("worker.jsonl");
+    let mut store = SessionFile::create("/fixture", None, 0);
+    store.set_path(path.clone());
+    store.rewrite().unwrap();
+    let session_id = store.session_id().to_string();
+    store
+        .persist_entry(
+            "custom_message",
+            json!({"customType":"rlm_session_assignment","details":{
+        "assignmentId":"error-task","artifactRef":"result.md","creatorSessionId":"creator",
+        "creatorSessionFile":"creator.jsonl","deliveryId":"error-delivery"}}),
+        )
+        .unwrap();
+    runner.core.lock().unwrap().store = Some(store);
+    // No assistant or settlement: no synthetic notice, even for a subscribed task.
+    runner.deliver_session_completion().await;
+    assert!(commands.lock().unwrap().is_empty());
+    runner.core.lock().unwrap().queued_input_suspended = true;
+    runner
+        .run_turn(
+            engine,
+            Lane::Steering,
+            vec![QueuedItem {
+                message: "work".into(),
+                priority: QueuePriority::Human,
+                preview: None,
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                input_identity: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            }],
+        )
+        .await;
+    let durable = SessionFile::open(&path).unwrap();
+    let assistant = durable
+        .entries
+        .iter()
+        .rev()
+        .find(|row| row.type_ == "message" && row.fields["message"]["role"] == "assistant")
+        .unwrap();
+    assert_eq!(assistant.fields["message"]["stopReason"], "error");
+    assert!(durable
+        .entries
+        .iter()
+        .any(|row| row.fields["customType"] == "rlm_session_settlement"
+            && row.fields["data"]["assistantId"] == assistant.id));
+    assert!(
+        commands.lock().unwrap().is_empty(),
+        "error cannot bypass input suspension"
+    );
+    runner.core.lock().unwrap().queued_input_suspended = false;
+    runner.core.lock().unwrap().abort_requested = true;
+    runner.deliver_session_completion().await;
+    assert!(
+        commands.lock().unwrap().is_empty(),
+        "error cannot bypass owner stop"
+    );
+    runner.core.lock().unwrap().abort_requested = false;
+    runner.deliver_session_completion().await;
+    runner.deliver_session_completion().await;
+    let rows = commands.lock().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["type"], "follow_up");
+    assert_eq!(rows[0]["activeSessionId"], "creator");
+    assert_eq!(rows[0]["queueKey"], "error-delivery");
+    let notice: Value = serde_json::from_str(
+        rows[0]["message"]
+            .as_str()
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(
+        notice,
+        json!({"assignmentId":"error-task","artifactRef":"result.md",
+        "deliveryId":"error-delivery","sessionId":session_id,"sessionFile":path.to_string_lossy(),
+        "status":"settled","stopReason":"error","resultPreview":"scripted failure","taskAccepted":false})
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_completion_fresh_runner_recovery_queries_only() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = seen.clone();
+    let server = tokio::spawn(async move {
+        let mut queries = 0;
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            writer.write_all(b"{\"type\":\"daemon_hello\",\"protocol\":{\"name\":\"prime-agent.daemon\",\"version\":7}}\n").await.unwrap();
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let command = &request["command"];
+                sink.lock().unwrap().push(command.clone());
+                if command["type"] == "follow_up" {
+                    // Response lost; this fixture does not claim recipient admission.
+                    break;
+                }
+                assert_eq!(command["type"], "get_input_receipts");
+                queries += 1;
+                let response = crate::protocol::response_line(&crate::protocol::response_success(
+                    request["id"].as_str(),
+                    "get_input_receipts",
+                    Some(json!({"durablyQueued":queries > 1,"receipts":[]})),
+                ));
+                writer
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let path = dir.path().join("worker.jsonl");
+    let mut store = SessionFile::create("/fixture", None, 0);
+    store.set_path(path.clone());
+    store.rewrite().unwrap();
+    let session_id = store.session_id().to_string();
+    store
+        .persist_entry(
+            "custom_message",
+            json!({"customType":"rlm_session_assignment","details":{
+        "assignmentId":"fresh-task","artifactRef":"result.md","creatorSessionId":"creator",
+        "creatorSessionFile":"creator.jsonl","deliveryId":"fresh-delivery"}}),
+        )
+        .unwrap();
+    store.persist_entry("message", json!({"message":{"role":"assistant","stopReason":"stop","content":[{"text":"result"}]}})).unwrap();
+    let mut old = burst_runner(Arc::new(GateProbeEngine::default()));
+    old.passivation.link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket.clone()));
+    old.core.lock().unwrap().store = Some(store);
+    old.record_session_settlement();
+    old.deliver_session_completion().await;
+    let durable = SessionFile::open(&path).unwrap();
+    assert_eq!(
+        durable.entries.last().unwrap().fields["data"],
+        json!({"deliveryId":"fresh-delivery","state":"unknown"})
+    );
+    let unknown_len = durable.entries.len();
+    drop(old);
+    // A new runner, link and recovery journal, reopening only the durable session.
+    let mut fresh = burst_runner(Arc::new(GateProbeEngine::default()));
+    fresh.passivation.link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
+    {
+        let mut core = fresh.core.lock().unwrap();
+        core.store = Some(SessionFile::open(&path).unwrap());
+        core.queued_input_suspended = true;
+    }
+    fresh.deliver_session_completion().await;
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    fresh.core.lock().unwrap().queued_input_suspended = false;
+    fresh.core.lock().unwrap().abort_requested = true;
+    fresh.deliver_session_completion().await;
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    fresh.core.lock().unwrap().abort_requested = false;
+    fresh.deliver_session_completion().await;
+    let unresolved = SessionFile::open(&path).unwrap();
+    assert_eq!(unresolved.entries.len(), unknown_len);
+    assert_eq!(
+        unresolved.entries.last().unwrap().fields["data"],
+        json!({"deliveryId":"fresh-delivery","state":"unknown"})
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "empty negative receipt is query-only"
+    );
+    fresh.deliver_session_completion().await;
+    let resolved = SessionFile::open(&path).unwrap();
+    assert_eq!(resolved.session_id(), session_id);
+    assert_eq!(resolved.entries.len(), unknown_len + 1);
+    assert_eq!(
+        resolved.entries.last().unwrap().fields["data"],
+        json!({"deliveryId":"fresh-delivery","state":"durably_queued"})
+    );
+    assert_eq!(
+        resolved
+            .entries
+            .iter()
+            .filter(|row| row.fields["customType"] == "rlm_session_assignment")
+            .count(),
+        1
+    );
+    fresh.deliver_session_completion().await;
+    let commands = seen.lock().unwrap().clone();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[0]["type"], "follow_up");
+    for command in &commands[1..] {
+        assert_eq!(command["type"], "get_input_receipts");
+        assert_eq!(command["activeSessionId"], "creator");
+        assert_eq!(command["completionTargetFile"], "creator.jsonl");
+        assert_eq!(command["queueKey"], "fresh-delivery");
+    }
+    drop(fresh);
+    server.abort();
+    let _ = server.await;
+}
