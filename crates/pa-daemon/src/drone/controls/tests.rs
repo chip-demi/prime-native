@@ -657,3 +657,219 @@ fn non_user_stop_unknown_reports_disabled_and_survives_restart() {
             .is_err());
     }
 }
+
+#[tokio::test]
+async fn action_admission_revalidates_authority_with_a_permitted_control() {
+    for case in [
+        "valid",
+        "paused",
+        "stopped",
+        "human",
+        "pending",
+        "intentional",
+        "stop_requested",
+        "binding",
+        "plan_stop",
+        "budget",
+        "plan_changed",
+        "disabled",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = Supervisor::new(crate::supervisor::SupervisorOptions {
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        })
+        .unwrap();
+        let (resident, mut descriptor) = resident(&supervisor, dir.path()).await;
+        opt_in(&supervisor.drone_controls, ROOT);
+        let path = dir.path().join("plan.json");
+        let plan = json!({"revision":"1","goal":"owned","acceptance":[],"capacity":0,
+            "userStopped":case=="plan_stop","budgetAvailable":case!="budget","steps":[]});
+        std::fs::write(&path, plan.to_string()).unwrap();
+        let roadmap = super::super::roadmap::read_bound(path.to_str(), dir.path()).unwrap();
+        descriptor
+            .create_command
+            .rest
+            .insert("droneRoadmapPath".into(), json!(path));
+        *resident.descriptor.lock().await = descriptor.clone();
+        let snapshot = json!({"activeSessionId":"active","sessionId":ROOT,"paused":false,
+            "stopped":false,"humanInputFingerprint":"human","pendingHumanInputs":0,"goal":null});
+        let mut fresh = snapshot.clone();
+        let expected = match case {
+            "valid" => None,
+            "paused" => {
+                fresh["paused"] = json!(true);
+                Some("drone_authority_withdrawn")
+            }
+            "stopped" => {
+                fresh["stopped"] = json!(true);
+                Some("drone_authority_withdrawn")
+            }
+            "human" => {
+                fresh["humanInputFingerprint"] = json!("new human");
+                Some("drone_authority_withdrawn")
+            }
+            "pending" => {
+                fresh["pendingHumanInputs"] = json!(1);
+                Some("drone_authority_withdrawn")
+            }
+            "intentional" => {
+                resident
+                    .intentional_stop
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Some("drone_authority_withdrawn")
+            }
+            "stop_requested" => {
+                resident.descriptor.lock().await.stop_requested_at = Some("stop".into());
+                Some("drone_authority_withdrawn")
+            }
+            "binding" => {
+                resident
+                    .descriptor
+                    .lock()
+                    .await
+                    .create_command
+                    .rest
+                    .insert("droneBindingRevision".into(), json!(1));
+                Some("stale_roadmap_recommendation")
+            }
+            "plan_stop" | "budget" => Some("authority_denied"),
+            "plan_changed" => {
+                std::fs::write(&path, "changed plan").unwrap();
+                Some("stale_roadmap_recommendation")
+            }
+            "disabled" => {
+                supervisor
+                    .drone_controls
+                    .root(ROOT)
+                    .unwrap()
+                    .mutate("stop", 1)
+                    .unwrap();
+                Some("drone_control_stopped")
+            }
+            _ => unreachable!(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        *resident.cmd_tx.lock().await = Some(tx);
+        let assessment = supervisor
+            .drone
+            .lock()
+            .unwrap()
+            .push(ROOT, Value::Null)
+            .unwrap();
+        let action = super::super::handlers::Action {
+            handler: "notify_root".into(),
+            args: json!({"message":"owned diagnostic"}),
+        };
+        let decision = supervisor.apply_drone_decision(
+            &resident,
+            &assessment,
+            &descriptor,
+            path.to_str(),
+            dir.path(),
+            &roadmap,
+            &snapshot,
+            None,
+            None,
+            action,
+        );
+        tokio::pin!(decision);
+        let mut admitted = 0;
+        let result = loop {
+            tokio::select! {
+                result=&mut decision => break result,
+                request=rx.recv() => {
+                    let request=request.unwrap();
+                    let data=match request.command_type.as_str() {
+                        "drone_snapshot" => Some(fresh.clone()),
+                        "follow_up" => {admitted+=1; Some(json!({"accepted":true}))},
+                        other => panic!("unexpected command {other}"),
+                    };
+                    resident.pending.lock().await.remove(&request.request_id).unwrap()
+                        .send(crate::registry::WorkerReply::Typed(crate::protocol::response_success(None,&request.command_type,data)))
+                        .unwrap_or_else(|_|panic!("missing receiver"));
+                }
+            }
+        };
+        if let Some(error) = expected {
+            assert_eq!(result.unwrap_err().to_string(), error, "{case}");
+            assert_eq!(admitted, 0, "{case}");
+        } else {
+            result.unwrap();
+            assert_eq!(admitted, 1);
+        }
+        assert!(rx.try_recv().is_err(), "no deferred action for {case}");
+    }
+}
+
+#[tokio::test]
+async fn action_delivery_deduplicates_noise_and_rearms_for_owned_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let supervisor = Supervisor::new(crate::supervisor::SupervisorOptions {
+        socket_path: dir.path().join("daemon.sock"),
+        agent_dir: dir.path().join("agent"),
+    })
+    .unwrap();
+    let (resident, descriptor) = resident(&supervisor, dir.path()).await;
+    opt_in(&supervisor.drone_controls, ROOT);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    *resident.cmd_tx.lock().await = Some(tx);
+    let mut assessment = supervisor
+        .drone
+        .lock()
+        .unwrap()
+        .push(ROOT, Value::Null)
+        .unwrap();
+    let mut snapshot = json!({"activeSessionId":"active","sessionId":ROOT,"paused":false,
+        "stopped":false,"humanInputFingerprint":"human","pendingHumanInputs":0,"goal":null});
+    let mut admitted = 0;
+    for (case, expected) in [
+        ("first", 1),
+        ("identical", 1),
+        ("reply_noise", 1),
+        ("owned_failure", 2),
+        ("same_failure", 2),
+    ] {
+        if case == "reply_noise" {
+            snapshot["queuedInputs"] = json!(99);
+            snapshot["recentRootAssistantEvidence"] = json!([{"text":"ACK"}]);
+        }
+        if case == "owned_failure" {
+            assessment.owned_job_outcome = Some("actual owned failure".into());
+        }
+        let decision = supervisor.apply_drone_decision(
+            &resident,
+            &assessment,
+            &descriptor,
+            None,
+            dir.path(),
+            &Value::Null,
+            &snapshot,
+            None,
+            None,
+            super::super::handlers::Action {
+                handler: "notify_root".into(),
+                args: json!({"message":"owned diagnostic"}),
+            },
+        );
+        tokio::pin!(decision);
+        loop {
+            tokio::select! {
+                result=&mut decision => {result.unwrap(); break},
+                request=rx.recv() => {
+                    let request=request.unwrap();
+                    let data=match request.command_type.as_str() {
+                        "drone_snapshot" => Some(snapshot.clone()),
+                        "follow_up" => {admitted+=1; Some(json!({"accepted":true}))},
+                        other=>panic!("unexpected command {other}"),
+                    };
+                    resident.pending.lock().await.remove(&request.request_id).unwrap()
+                        .send(crate::registry::WorkerReply::Typed(crate::protocol::response_success(None,&request.command_type,data)))
+                        .unwrap_or_else(|_|panic!("missing receiver"));
+                }
+            }
+        }
+        assert_eq!(admitted, expected, "{case}");
+        assert!(rx.try_recv().is_err());
+    }
+}
