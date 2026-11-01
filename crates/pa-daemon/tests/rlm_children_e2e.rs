@@ -890,3 +890,215 @@ async fn rlm_create_session_completion_uses_real_durable_creator_queue() {
         assert_eq!(client.read_response(id)["success"], true);
     }
 }
+
+// Both completion e2e cases keep the creator paused so the actual queue is observable.
+fn completion_creator(client: &mut Client, agent_dir: &Path, script: &Path) -> Value {
+    client.send_command(
+        "creator",
+        &json!({"type":"create", "name":"coordinator",
+        "telemetryDisabled":true, "config":{"cwd":agent_dir,"script":script}}),
+    );
+    let created = client.read_response("creator");
+    assert_eq!(created["success"], true, "{created}");
+    let creator = created["data"]["activeSessionId"].as_str().unwrap();
+    client.send_command(
+        "pause",
+        &json!({"type":"acquire_session_input_pause",
+        "activeSessionId":creator,"leaseKey":"completion-e2e"}),
+    );
+    assert_eq!(client.read_response("pause")["success"], true);
+    created["data"].clone()
+}
+
+fn completion_registry(
+    socket: &Path,
+    agent_dir: &Path,
+    script: &Path,
+    creator: &Value,
+) -> SupervisorChildSessions {
+    let sessions = children(socket, agent_dir, script, 0);
+    sessions.set_identity(ParentIdentity {
+        rlm_depth: 0,
+        rlm_max_depth: 2,
+        model: Some("faux/faux-1".into()),
+        cwd: Some(agent_dir.to_string_lossy().into()),
+        session_id: Some(creator["sessionId"].as_str().unwrap().into()),
+        session_file: Some(creator["sessionFile"].as_str().unwrap().into()),
+        thinking: None,
+        child_script: Some(script.to_string_lossy().into()),
+    });
+    sessions
+}
+
+fn completion_queue(client: &mut Client, creator: &str) -> Value {
+    client.send_command(
+        "queue",
+        &json!({"type":"get_queue","activeSessionId":creator}),
+    );
+    let queue = client.read_response("queue");
+    assert_eq!(queue["success"], true, "{queue}");
+    queue["data"].clone()
+}
+
+#[tokio::test]
+async fn session_completion_survives_supervisor_restart_and_sender_recreation() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let mut daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, _) = Client::connect(&socket);
+    let script = write_script(dir.path(), "durable independent result");
+    let creator = completion_creator(&mut client, &agent_dir, &script);
+    let creator_id = creator["activeSessionId"].as_str().unwrap();
+    let sessions = completion_registry(&socket, &agent_dir, &script, &creator);
+    let handle = sessions
+        .create_session(RlmCreateSessionRequest {
+            prompt: "work".into(),
+            name: Some("restart-worker".into()),
+            model: None,
+            thinking: None,
+            cwd: None,
+            completion: Some(json!({"assignment_id":"restart-task","artifact_ref":"result.md"})),
+        })
+        .await
+        .unwrap();
+    let before = wait_until(Duration::from_secs(10), || {
+        let queue = completion_queue(&mut client, creator_id);
+        queue.to_string().contains("restart-task").then_some(queue)
+    });
+    let durable_before = std::fs::read_to_string(&handle.session_file).unwrap();
+    assert!(durable_before.contains("durably_queued"));
+    // SIGKILL only this isolated supervisor. Workers survive and re-register.
+    let old_pid = daemon.child.id();
+    daemon.child.kill().unwrap();
+    assert!(!daemon.child.wait().unwrap().success());
+    drop(client);
+    let replacement = spawn_daemon(&socket, &agent_dir);
+    assert_ne!(replacement.child.id(), old_pid);
+    daemon = replacement;
+    let (mut client, _) = Client::connect(&socket);
+    let after = wait_until(Duration::from_secs(10), || {
+        client.send_command("list", &json!({"type":"list"}));
+        let list = client.read_response("list");
+        let rows = list["data"]["sessions"].as_array()?;
+        rows.iter()
+            .any(|row| row["sessionId"] == creator["sessionId"])
+            .then_some(())
+    });
+    let _ = after;
+    assert_eq!(completion_queue(&mut client, creator_id), before);
+    // Stop/reap the sender via its supervisor, then create a new worker from its file.
+    // This is real worker recreation, not a claim of SIGKILL at the lost-ACK window.
+    client.send_command(
+        "kill-sender",
+        &json!({"type":"kill","activeSessionId":handle.active_session_id}),
+    );
+    assert_eq!(client.read_response("kill-sender")["success"], true);
+    client.send_command(
+        "restore-sender",
+        &json!({"type":"create","name":"restored-worker",
+        "sessionPath":handle.session_file,"telemetryDisabled":true,
+        "config":{"cwd":agent_dir,"script":script}}),
+    );
+    let restored = client.read_response("restore-sender");
+    assert_eq!(restored["success"], true, "{restored}");
+    assert_eq!(restored["data"]["sessionId"], handle.session_id);
+    let restored_id = restored["data"]["activeSessionId"].as_str().unwrap();
+    assert_ne!(restored_id, handle.active_session_id);
+    client.send_command(
+        "idle",
+        &json!({"type":"wait_for_idle","activeSessionId":restored_id}),
+    );
+    assert_eq!(client.read_response("idle")["success"], true);
+    assert_eq!(
+        completion_queue(&mut client, creator_id),
+        before,
+        "no duplicate completion after recreation"
+    );
+    let durable_after = std::fs::read_to_string(&handle.session_file).unwrap();
+    assert_eq!(durable_after.matches("rlm_session_assignment").count(), 1);
+    assert_eq!(durable_after.matches("durably_queued").count(), 1);
+    for (id, target) in [("kill-restored", restored_id), ("kill-creator", creator_id)] {
+        client.send_command(id, &json!({"type":"kill","activeSessionId":target}));
+        assert_eq!(client.read_response(id)["success"], true);
+    }
+    drop(daemon);
+}
+
+#[tokio::test]
+async fn session_completion_real_background_bash_waits_for_final_settlement() {
+    // Required, not a silent skip: this case must execute a real kernel and OS bash.
+    let python = std::env::var("PA_E2E_KERNEL_PYTHON").expect("set PA_E2E_KERNEL_PYTHON");
+    assert!(Path::new(&python).exists());
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    // Existing spawn helper inherits PRIME_AGENT_KERNEL_PYTHON from the test command.
+    let _daemon = spawn_daemon(&socket, &agent_dir);
+    let (mut client, _) = Client::connect(&socket);
+    let release = dir.path().join("release");
+    let started = dir.path().join("started");
+    let cell = format!("h = bash(\"touch {}; while [ ! -f {} ]; do sleep 0.05; done; echo COMPLETION_OS_DONE\")\nprint(h.pid)", started.display(), release.display());
+    let script = dir.path().join("background.json");
+    std::fs::write(
+        &script,
+        json!({"engine":"faux","responses":[
+            {"content":[{"type":"toolCall","name":"python_repl","arguments":{"code":cell}}]},
+            {"text":"intermediate background response"},
+            {"text":"latest final OS result"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let creator = completion_creator(&mut client, &agent_dir, &script);
+    let creator_id = creator["activeSessionId"].as_str().unwrap();
+    let sessions = completion_registry(&socket, &agent_dir, &script, &creator);
+    let handle = sessions
+        .create_session(RlmCreateSessionRequest {
+            prompt: "start background work".into(),
+            name: Some("os-worker".into()),
+            model: None,
+            thinking: None,
+            cwd: None,
+            completion: Some(json!({"assignment_id":"os-task","artifact_ref":"result.md"})),
+        })
+        .await
+        .unwrap();
+    wait_until(Duration::from_secs(20), || {
+        let file = std::fs::read_to_string(&handle.session_file).ok()?;
+        (started.exists() && file.contains("intermediate background response")).then_some(())
+    });
+    assert!(
+        !completion_queue(&mut client, creator_id)
+            .to_string()
+            .contains("os-task"),
+        "running OS bash must block completion"
+    );
+    std::fs::write(&release, "finish").unwrap();
+    let notice = wait_until(Duration::from_secs(20), || {
+        let queue = completion_queue(&mut client, creator_id).to_string();
+        queue.contains("os-task").then_some(queue)
+    });
+    assert!(notice.contains("latest final OS result"), "{notice}");
+    assert!(
+        !notice.contains("intermediate background response"),
+        "{notice}"
+    );
+    assert!(notice.contains("taskAccepted"));
+    let file = std::fs::read_to_string(&handle.session_file).unwrap();
+    assert!(
+        file.contains("async_bash_completion"),
+        "real bash completion must be durable"
+    );
+    assert!(file.contains("COMPLETION_OS_DONE"));
+    assert_eq!(file.matches("durably_queued").count(), 1);
+    for (id, target) in [
+        ("kill-worker", handle.active_session_id.as_str()),
+        ("kill-creator", creator_id),
+    ] {
+        client.send_command(id, &json!({"type":"kill","activeSessionId":target}));
+        assert_eq!(client.read_response(id)["success"], true);
+    }
+}
