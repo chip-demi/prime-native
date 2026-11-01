@@ -1,4 +1,226 @@
 use super::*;
+/// Ledger reopening is passive history, not a replayable terminal outbox.
+/// Neither a progress note nor a prior generic reply survives as live work.
+#[tokio::test]
+async fn a2_ledger_reopen_keeps_settled_children_passive_without_notice_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = dir.path().join("agent");
+    let session_dir = dir.path().join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let parent = session_dir.join("parent.jsonl");
+    let child = session_dir.join("child.jsonl");
+    std::fs::write(&parent, "").unwrap();
+    std::fs::write(&child, "").unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (original, _) =
+        sessions_with_fake_supervisor(tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    let socket = original.inner.link.socket_path().clone();
+    let config = crate::descriptor::descriptor_dir(&agent, &socket)
+        .join(crate::descriptor::SUPERVISOR_CONFIG_FILE_NAME);
+    crate::descriptor::persist_supervisor_config(
+        &config,
+        &crate::descriptor::PersistedSupervisorConfig {
+            version: 1,
+            socket_path: socket.display().to_string(),
+            default_session_dir: Some(session_dir.display().to_string()),
+        },
+    )
+    .unwrap();
+    let ledger = crate::rlm_ledger::rlm_ledger_path(&agent, &session_dir);
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    let edge = json!({"v":1,"op":"spawn","at":"2026-11-01T00:00:00Z",
+        "childId":"reopened", "parent":parent, "child":child, "depth":1,"name":"reopened"});
+    std::fs::write(ledger, format!("{edge}\n")).unwrap();
+    let reopened = SupervisorChildSessions::new(
+        Arc::new(crate::supervisor_link::SupervisorLink::new(socket)),
+        agent.clone(),
+        "parent-live".into(),
+        Arc::new(crate::model_allowlist::ModelRefusalTelemetry::new(
+            agent, true,
+        )),
+        String::new(),
+    );
+    reopened.set_identity(ParentIdentity {
+        session_file: Some(parent.display().to_string()),
+        ..ParentIdentity::with_default_depth()
+    });
+    reopened.reseed_from_ledger().await;
+    let record = reopened
+        .inner
+        .find_record("reopened")
+        .await
+        .expect("ledger row");
+    {
+        let row = record.lock().await;
+        assert!(row.settled);
+        assert!(row.notice_delivered);
+        assert!(!row.replied_since_task);
+        assert_eq!(row.progress_note, None);
+    }
+    reopened.inner.watch_child_settle(&record).await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+/// Exercise the child registry boundary used by progress summaries and incoming
+/// agent messages. Message text is not classified here: progress and final
+/// agent messages both call mark_replied in the parent input consumer.
+#[tokio::test]
+async fn a2_progress_note_and_generic_reply_have_distinct_settle_semantics() {
+    for child in [FakeChild::Healthy, FakeChild::FinalTurnFails] {
+        for replied in [false, true] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (sessions, _) =
+                sessions_with_fake_supervisor(tx, 0, FakeKill::Success, child).await;
+            sessions.notify_turn_started();
+            let handle = spawn_child(&sessions).await;
+            let record = sessions
+                .inner
+                .find_record(&handle.rlm_child_id)
+                .await
+                .unwrap();
+            // An accepted progress_note reaches the registry through get_state,
+            // independently of the generic message reply marker.
+            let notes = pa_core::session_engine::rlm_host::RlmProgressNotes::default();
+            assert!(notes.note("checking the consumer", 7).accepted);
+            let mut summary = json!({"isStreaming": true});
+            summary["progressNote"] = json!(notes.latest_note().unwrap().0);
+            record.lock().await.observe_summary(&summary);
+            if replied {
+                sessions.mark_replied("child-live").await;
+            }
+            assert_eq!(record.lock().await.replied_since_task, replied);
+            let settled = sessions.settle_notified();
+            sessions.notify_turn_done();
+            tokio::time::timeout(Duration::from_secs(10), settled)
+                .await
+                .unwrap();
+            let row = record.lock().await;
+            assert!(row.settled);
+            assert_eq!(
+                row.settled_status,
+                Some(if matches!(child, FakeChild::FinalTurnFails) {
+                    "error"
+                } else {
+                    "done"
+                })
+            );
+            if replied {
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert!(!row.notice_delivered);
+            } else {
+                let notice = rx.try_recv().expect("a note does not suppress the result");
+                assert_eq!(
+                    notice["customMessage"]["details"]["childId"],
+                    handle.rlm_child_id
+                );
+                assert!(row.notice_delivered);
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+}
+
+/// The message wins before the watcher claims a notice, even when answer
+/// capture is already in flight. A later message cannot retract a sent notice.
+#[tokio::test]
+async fn a2_late_reply_during_answer_capture_suppresses_only_unsent_notice() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(FakePeerGate {
+        armed: AtomicBool::new(true),
+        ..FakePeerGate::default()
+    });
+    let (sessions, _) = sessions_with_fake_child_subagents(
+        tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::new(FakeChildSubagents {
+            answer_gate: Some(Arc::clone(&gate)),
+            ..FakeChildSubagents::default()
+        }),
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "late-reply".into(),
+            active_session_id: "child-live".into(),
+            session_id: Some("child-file".into()),
+            session_name: "late-reply".into(),
+        })
+        .await;
+    let record = sessions.inner.find_record("late-reply").await.unwrap();
+    let inner = Arc::clone(&sessions.inner);
+    let row = Arc::clone(&record);
+    let watcher = tokio::spawn(async move {
+        inner.watch_child_settle(&row).await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.copied.notified())
+        .await
+        .unwrap();
+    sessions.mark_replied("child-live").await;
+    gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), watcher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(record.lock().await.settled);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    // Start a fresh admitted task, with no reply, on the same endpoint.
+    let dir = tempfile::tempdir().unwrap();
+    sessions
+        .prepare_admission_display_for_test("late-reply", dir.path())
+        .await;
+    let admission = sessions
+        .begin_child_admission("late-reply")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!record.lock().await.replied_since_task);
+    admission
+        .accepted(
+            &pa_core::session_engine::agent_messaging::AgentMessageReceipt {
+                id: "new-task".into(),
+                target: "child-live".into(),
+                target_session_id: Some("child-file".into()),
+                target_session_name: None,
+                target_runtime_kind: None,
+                message: "next task".into(),
+                delivery_status:
+                    pa_core::session_engine::agent_messaging::AgentMessageDeliveryStatus::Delivered,
+                delivery_mode: None,
+                receiver_role: None,
+                delivered_at: None,
+                queued_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    sessions.mark_replied("child-live").await;
+    sessions.inner.watch_child_settle(&record).await;
+    assert!(record.lock().await.notice_delivered);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
 use crate::protocol::{response_failure, response_success};
 use pa_core::session_engine::semantic_edges::{
     ChildCancelledReason, SemanticEdgeIdentity, SemanticEdgeLedgerEvent, SemanticEdgeRecorder,
@@ -325,6 +547,12 @@ async fn spawn_fake_supervisor(
                             }
                         }
                         "get_last_assistant_text" => {
+                            if let Some(gate) = child_subagents.answer_gate.as_ref()
+                                .filter(|gate| gate.armed.swap(false, Ordering::SeqCst))
+                            {
+                                gate.copied.notify_one();
+                                gate.release.notified().await;
+                            }
                             if matches!(child, FakeChild::GatedAnswer) {
                                 RETASK_ANSWER_STARTED.notify_one();
                                 RETASK_ANSWER_RELEASE.notified().await;
@@ -456,6 +684,7 @@ struct FakeChildSubagents {
     peer_gate: Option<Arc<FakePeerGate>>,
     /// Holds the task `prompt` in flight: the worker has not accepted it yet.
     prompt_gate: Option<Arc<FakePeerGate>>,
+    answer_gate: Option<Arc<FakePeerGate>>,
 }
 
 #[derive(Default)]
