@@ -1,0 +1,1 @@
+- Add opt-in assignment-scoped settlement notices for independent sessions through the durable follow-up queue, without treating settlement as task acceptance.

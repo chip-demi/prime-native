@@ -1,0 +1,351 @@
+//! The coordinator status file (spec §7 `status.json`): every state writes
+//! `{update_id, state, epoch, updated_at}` before acting, atomically
+//! (tmp + rename, 0600), with a 5 s heartbeat so a tailed coordinator can
+//! distinguish "working" from "hung" (the `epoch` blocks late writes).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use pa_types::daemon::update_flow::{
+    UpdateId, UpdateProcessIdentity, UpdateState, UpdateStatus, UpdateStatusCounts,
+    UPDATE_STATUS_FORMAT_VERSION,
+};
+use serde_json::json;
+use tokio::sync::Mutex;
+
+/// The status heartbeat interval.
+pub const STATUS_HEARTBEAT_MS: u64 = 5_000;
+
+/// The telemetry outcome names for terminal states (a rollback that ends
+/// serving is `complete` on the old version, the rollback in the message).
+pub const UPDATE_TELEMETRY_STATE_NAMES: &[(UpdateState, &str)] = &[
+    (UpdateState::Complete, "complete"),
+    (UpdateState::Skipped, "skipped"),
+    (UpdateState::Aborted, "aborted"),
+    (UpdateState::Failed, "failed"),
+];
+
+/// Reads and writes one status file.
+pub struct StatusWriter {
+    path: PathBuf,
+    status: UpdateStatus,
+}
+
+impl StatusWriter {
+    /// A fresh coordinator status at `Acquire` (epoch starts at 1), the initial
+    /// record on disk before the caller proceeds (a joining tail never races it).
+    ///
+    /// # Errors
+    /// Returns an error when the initial status record cannot be persisted.
+    pub fn new(path: &Path, update_id: &UpdateId, socket_path: &str) -> Result<Self> {
+        let writer = Self::fresh(path, update_id, socket_path);
+        writer
+            .persist()
+            .context("write the initial coordinator status")?;
+        Ok(writer)
+    }
+
+    /// The in-memory `Acquire` record without a disk write (the adoption path rewrites the epoch
+    /// before its single persisting write).
+    fn fresh(path: &Path, update_id: &UpdateId, socket_path: &str) -> Self {
+        let now = crate::util_time::now_iso8601();
+        let identity = coordinator_identity();
+        Self {
+            path: path.to_path_buf(),
+            status: UpdateStatus {
+                version: UPDATE_STATUS_FORMAT_VERSION,
+                update_id: update_id.clone(),
+                socket_path: socket_path.to_string(),
+                state: UpdateState::Acquire,
+                epoch: 1,
+                coordinator: Some(identity),
+                predecessor: None,
+                successor: None,
+                counts: UpdateStatusCounts::default(),
+                failures: Vec::new(),
+                message: None,
+                started_at: now.clone(),
+                updated_at: now.clone(),
+                heartbeat_at: Some(now),
+                rest: serde_json::Map::default(),
+            },
+        }
+    }
+
+    /// Adopt the status file of an earlier writer (the CLI staged through
+    /// `Staged`): the epoch continues above the recorded one, so the
+    /// predecessor's writes can never regress this process's.
+    ///
+    /// # Errors
+    /// Returns an error when the adopted status record cannot be persisted.
+    pub fn adopt(path: &Path, update_id: &UpdateId, socket_path: &str) -> Result<Self> {
+        let status = read_status(path).context("read the staged coordinator status")?;
+        anyhow::ensure!(
+            status.update_id == *update_id && status.socket_path == socket_path,
+            "the staged coordinator status belongs to another update"
+        );
+        let mut writer = Self {
+            path: path.to_path_buf(),
+            status,
+        };
+        writer.status.coordinator = Some(coordinator_identity());
+        writer.touch();
+        writer
+            .persist()
+            .context("write the adopted coordinator status")?;
+        Ok(writer)
+    }
+
+    /// Move to `state` (illegal moves are a driver bug — pa-types owns
+    /// the table) and persist before acting.
+    ///
+    /// # Errors
+    /// Returns an error when the status record cannot be written to disk.
+    pub fn set_state(&mut self, state: UpdateState) -> Result<()> {
+        debug_assert!(
+            pa_types::daemon::update_flow::update_transition_allowed(self.status.state, state),
+            "illegal coordinator transition {:?} -> {:?}",
+            self.status.state,
+            state
+        );
+        self.status.state = state;
+        self.touch();
+        self.persist()
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the status record cannot be written to disk.
+    pub fn set_message(&mut self, message: Option<String>) -> Result<()> {
+        self.status.message = message;
+        self.touch();
+        self.persist()
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the status record cannot be written to disk.
+    pub fn set_predecessor(&mut self, identity: UpdateProcessIdentity) -> Result<()> {
+        self.status.predecessor = Some(identity);
+        self.touch();
+        self.persist()
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the status record cannot be written to disk.
+    pub fn set_successor(&mut self, identity: UpdateProcessIdentity) -> Result<()> {
+        self.status.successor = Some(identity);
+        self.touch();
+        self.persist()
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the status record cannot be written to disk.
+    pub fn set_counts(&mut self, counts: UpdateStatusCounts) -> Result<()> {
+        self.status.counts = counts;
+        self.touch();
+        self.persist()
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the status record cannot be written to disk.
+    pub fn set_failures(
+        &mut self,
+        failures: Vec<pa_types::daemon::update_flow::UpdateStatusFailure>,
+    ) -> Result<()> {
+        self.status.failures = failures;
+        self.touch();
+        self.persist()
+    }
+
+    #[must_use]
+    pub fn state(&self) -> UpdateState {
+        self.status.state
+    }
+
+    #[must_use]
+    pub fn current(&self) -> &UpdateStatus {
+        &self.status
+    }
+
+    /// Refresh `updated_at`/`heartbeat_at` (every mutation and the heartbeat).
+    fn touch(&mut self) {
+        let now = crate::util_time::now_iso8601();
+        self.status.updated_at.clone_from(&now);
+        self.status.heartbeat_at = Some(now);
+        self.status.epoch += 1;
+    }
+
+    /// The atomic status write: temp file in the same directory, `rename` over
+    /// the old file. The parent directory is (re)created on every write: the
+    /// successor's boot sweep (spec §6 step 1) deletes the scratch dir — a
+    /// live coordinator's status file included — before `Restoring`/`Complete`.
+    fn persist(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let temporary = self
+            .path
+            .with_extension(format!("{}.tmp", std::process::id()));
+        let content = serde_json::to_string_pretty(&json!(self.status))? + "\n";
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)
+                .with_context(|| format!("create {}", temporary.display()))?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&temporary, content)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::rename(&temporary, &self.path)
+            .with_context(|| format!("finalize {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+/// This coordinator process's identity (the TS `getProcessStartId` contract).
+#[must_use]
+pub fn coordinator_identity() -> UpdateProcessIdentity {
+    let pid = std::process::id();
+    UpdateProcessIdentity {
+        pid: u64::from(pid),
+        process_start_id: pa_daemon::lease::get_process_start_id(pid),
+        supervisor_generation: None,
+        supervisor_owner_token: None,
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// Parse a status file; `None` when absent or unparseable (a missing status surfaces as "keep
+/// waiting" while the holder lives).
+#[must_use]
+pub fn read_status(path: &Path) -> Option<UpdateStatus> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// The status heartbeat task handle: `stop()` waits for one final beat.
+pub struct StatusHeartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StatusHeartbeat {
+    /// Heartbeat `writer` every [`STATUS_HEARTBEAT_MS`] until stopped. A failed
+    /// write never kills the FSM: the tail treats a stale beat as liveness.
+    pub fn start(writer: Arc<Mutex<StatusWriter>>) -> Self {
+        let task = tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_millis(STATUS_HEARTBEAT_MS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let mut writer = writer.lock().await;
+                let now = crate::util_time::now_iso8601();
+                writer.status.updated_at.clone_from(&now);
+                writer.status.heartbeat_at = Some(now);
+                writer.status.epoch += 1;
+                let _ = writer.persist();
+            }
+        });
+        Self { task }
+    }
+
+    pub fn stop(self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn update_id() -> UpdateId {
+        UpdateId::from("u1".to_string())
+    }
+
+    #[tokio::test]
+    async fn writes_and_receives_the_ts_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let mut writer = StatusWriter::new(&path, &update_id(), "/tmp/s.sock").unwrap();
+        assert_eq!(read_status(&path).unwrap().state, UpdateState::Acquire);
+        writer.set_state(UpdateState::Planning).unwrap();
+        writer.set_message(Some("planned".into())).unwrap();
+        let read = read_status(&path).expect("status parses back");
+        assert_eq!(read.state, UpdateState::Planning);
+        assert_eq!(read.message.as_deref(), Some("planned"));
+        assert_eq!(read.version, 1);
+        assert_eq!(read.update_id, update_id());
+        assert!(read.epoch > 1, "the epoch advances per write");
+        assert!(read.coordinator.is_some());
+    }
+
+    #[tokio::test]
+    async fn adoption_continues_the_epoch_above_the_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let predecessor = {
+            // The predecessor drives the spec's legal path to `Staged`: the coordinator's
+            // `set_state` asserts the transition table.
+            let mut writer = StatusWriter::new(&path, &update_id(), "/tmp/s.sock").unwrap();
+            writer.set_state(UpdateState::Planning).unwrap();
+            writer.set_state(UpdateState::Downloading).unwrap();
+            writer.set_state(UpdateState::Staged).unwrap();
+            writer
+                .set_message(Some("candidate verified".to_string()))
+                .unwrap();
+            writer.current().clone()
+        };
+        let mut successor = StatusWriter::adopt(&path, &update_id(), "/tmp/s.sock").unwrap();
+        assert_eq!(
+            read_status(&path).unwrap(),
+            UpdateStatus {
+                epoch: predecessor.epoch + 1,
+                coordinator: Some(coordinator_identity()),
+                updated_at: successor.current().updated_at.clone(),
+                heartbeat_at: successor.current().heartbeat_at.clone(),
+                ..predecessor
+            }
+        );
+        // The next real coordinator transition must remain legal after handoff.
+        successor.set_state(UpdateState::Preparing).unwrap();
+        assert_eq!(read_status(&path).unwrap(), *successor.current());
+    }
+
+    #[tokio::test]
+    async fn missing_or_corrupt_status_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_status(&dir.path().join("absent.json")).is_none());
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "{ not json").unwrap();
+        assert!(read_status(&corrupt).is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_touches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let writer = Arc::new(Mutex::new(
+            StatusWriter::new(&path, &update_id(), "/tmp/s.sock").unwrap(),
+        ));
+        let before = read_status(&path).unwrap().epoch;
+        let heartbeat = StatusHeartbeat::start(Arc::clone(&writer));
+        tokio::time::sleep(std::time::Duration::from_millis(STATUS_HEARTBEAT_MS + 200)).await;
+        heartbeat.stop();
+        let after = read_status(&path).unwrap().epoch;
+        assert!(after > before, "the heartbeat beat at least once");
+    }
+}

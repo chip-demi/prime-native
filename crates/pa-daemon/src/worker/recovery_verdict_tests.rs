@@ -1,0 +1,390 @@
+//! Worker tests.
+use super::*;
+
+fn worker_with_journal() -> Arc<Worker> {
+    let dir = std::env::temp_dir().join(format!("pa-worker-verdict-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = WorkerConfig {
+        socket_path: dir.join("worker.sock"),
+        supervisor_socket_path: PathBuf::new(),
+        token: "token".to_string(),
+        worker_instance_id: String::new(),
+        active_session_id: "target-session".to_string(),
+        agent_dir: dir.join("agent"),
+        recovery_journal_path: dir.join("recovery.jsonl"),
+        telemetry_disabled: None,
+        script: Some(json!({ "responses": ["ack"] })),
+    };
+    let worker = Arc::new(Worker::new(config, None));
+    // The journal is opened in `serve()`; tests open it directly so the
+    // checkpoints have the same durable sink as production.
+    *worker.recovery.lock().unwrap() =
+        Some(WorkerRecoveryJournal::open(&worker.config.recovery_journal_path).unwrap());
+    worker
+}
+
+async fn created_worker_with_journal() -> Arc<Worker> {
+    let worker = worker_with_journal();
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    worker
+}
+
+fn latest_record(worker: &Worker) -> crate::journal::WorkerRecoveryRecord {
+    WorkerRecoveryJournal::read_latest(&worker.config.recovery_journal_path)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.active_session_id == "target-session")
+        .expect("session record")
+}
+
+/// The admission (not the pickup) proves the work, so a plain boot revives the worker.
+#[tokio::test]
+async fn idle_time_injected_admission_is_busy_evidence() {
+    let worker = created_worker_with_journal().await;
+    // Settle first: the create record's busy=true must not mask the
+    // admission's verdict.
+    worker.dispatch("clear_queue", &json!({})).await;
+    assert!(
+        !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the settled session proves nothing"
+    );
+    let notify = Arc::new(Notify::new());
+    admit_autonomous_follow_up(
+        &worker.recovery,
+        &worker.core,
+        &notify,
+        "continue the mission".to_string(),
+    );
+    assert!(
+        WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the injected admission is live work"
+    );
+    let latest = latest_record(&worker);
+    assert_eq!(latest.operation, "follow_up_queued");
+    let (steering, follow_up, _) = WorkerRecoveryJournal::read_queue_snapshot(
+        &worker.config.recovery_journal_path,
+        "target-session",
+    )
+    .unwrap()
+    .expect("the admission flushed its snapshot");
+    assert!(steering.is_empty(), "steering: {steering:?}");
+    assert_eq!(follow_up[0].message, "continue the mission");
+    let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+}
+
+/// An idle session wakes on an invisible injected row; the admission is journal busy evidence.
+#[tokio::test]
+async fn a_bash_completion_notice_admits_the_steering_lane_with_busy_evidence() {
+    let worker = created_worker_with_journal().await;
+    worker.dispatch("clear_queue", &json!({})).await;
+    let notify = Arc::new(Notify::new());
+    admit_kernel_notice(
+        &worker.recovery,
+        &worker.core,
+        &notify,
+        crate::engine::KernelNotice::bash_completion(4321, "sleep 12; echo RW_WAKE_DONE", 0),
+        || false,
+    );
+    let core = worker.core.lock().unwrap();
+    let item = core
+        .steering
+        .front()
+        .expect("the notice queues on the steering lane");
+    let row = item.custom_message.as_ref().expect("the injected row");
+    assert_eq!(
+        row.get("customType").and_then(Value::as_str),
+        Some("async_bash_completion"),
+        "the row is the async-bash-completion notice: {row}"
+    );
+    assert_eq!(
+        row["details"]["pid"],
+        json!(4321),
+        "the notice carries its pid: {row}"
+    );
+    assert!(
+        item.message.starts_with("[bash-done pid:4321 exit:0]"),
+        "the turn runs on the notice content: {item:?}"
+    );
+    assert!(
+        item.preview
+            .as_deref()
+            .is_some_and(|preview| preview.starts_with("Background command finished: ")),
+        "the queue row carries the TS preview label: {item:?}"
+    );
+    // An idle session's wake is an invisible injected turn.
+    assert!(!item.queue_visible, "the idle wake stays invisible");
+    drop(core);
+    assert!(
+        WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the notice admission is live work"
+    );
+    let latest = latest_record(&worker);
+    assert_eq!(latest.operation, "steer_queued");
+    let (steering, _, _) = WorkerRecoveryJournal::read_queue_snapshot(
+        &worker.config.recovery_journal_path,
+        "target-session",
+    )
+    .unwrap()
+    .expect("the admission flushed its snapshot");
+    assert_eq!(
+        steering[0].message,
+        "[bash-done pid:4321 exit:0]\n\nCommand: \"sleep 12; echo RW_WAKE_DONE\""
+    );
+    let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+}
+
+/// A busy session queues the notice as a visible steer row (TS `queueIfBusy`).
+#[tokio::test]
+async fn a_bash_completion_notice_on_a_busy_session_queues_a_visible_steer_row() {
+    let worker = created_worker_with_journal().await;
+    worker.core.lock().unwrap().busy = true;
+    let notify = Arc::new(Notify::new());
+    admit_kernel_notice(
+        &worker.recovery,
+        &worker.core,
+        &notify,
+        crate::engine::KernelNotice::bash_completion(99, "make gates", 2),
+        || false,
+    );
+    let core = worker.core.lock().unwrap();
+    let item = core.steering.front().expect("the queued notice");
+    assert!(item.queue_visible, "the busy session keeps a visible row");
+    assert_eq!(item.policy, TurnPolicy::Queued);
+    drop(core);
+    let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+}
+
+/// The withdrawal settles the busy evidence so the journal never promises a replay.
+#[tokio::test]
+async fn bash_consumed_withdraws_the_undelivered_notice_and_settles() {
+    let worker = created_worker_with_journal().await;
+    worker.dispatch("clear_queue", &json!({})).await;
+    let notify = Arc::new(Notify::new());
+    admit_kernel_notice(
+        &worker.recovery,
+        &worker.core,
+        &notify,
+        crate::engine::KernelNotice::bash_completion(4321, "sleep 12; echo RW_WAKE_DONE", 0),
+        || false,
+    );
+    assert!(
+        WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the notice admission is live work"
+    );
+    // A different command under a reused pid must not withdraw (TS
+    // `_isAsyncBashCompletionActionFor` matches both).
+    withdraw_bash_completion_notice(
+        &worker.recovery,
+        &worker.core,
+        &crate::engine::BashConsumedNotice {
+            pid: 4321,
+            command: "another command".to_string(),
+        },
+        Some(worker.engine.as_ref()),
+    );
+    assert!(
+        worker.core.lock().unwrap().steering.len() == 1,
+        "the mismatched withdrawal kept the row"
+    );
+    assert!(
+        WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the kept row stays live work"
+    );
+    withdraw_bash_completion_notice(
+        &worker.recovery,
+        &worker.core,
+        &crate::engine::BashConsumedNotice {
+            pid: 4321,
+            command: "sleep 12; echo RW_WAKE_DONE".to_string(),
+        },
+        /*engine*/
+        None, // A retired engine must not prevent withdrawal or its checkpoint.
+    );
+    {
+        let core = worker.core.lock().unwrap();
+        assert!(
+            core.steering.is_empty() && core.follow_up.is_empty(),
+            "the consumed notice withdrew"
+        );
+    }
+    assert!(
+        !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the withdrawal settled the busy evidence"
+    );
+    let latest = latest_record(&worker);
+    assert_eq!(latest.operation, "queue_purged");
+    let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+}
+
+/// Cancelling an owned queued admission settles the verdict: removed rows
+/// leave no busy evidence and no replayable snapshot.
+#[tokio::test]
+async fn cancelled_admission_drop_settles_the_verdict() {
+    let worker = created_worker_with_journal().await;
+    worker.dispatch("clear_queue", &json!({})).await;
+    let admitted = worker
+        .dispatch("prompt", &json!({ "admissionId": "a1", "message": "go" }))
+        .await;
+    assert!(admitted.success, "prompt failed: {admitted:?}");
+    assert!(
+        WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the admitted prompt is live work"
+    );
+    let cancelled = worker
+        .dispatch(
+            "cancel_prompt_admission",
+            &json!({ "admissionId": "a1", "cancelOwned": true }),
+        )
+        .await;
+    assert_eq!(cancelled.data, Some(json!({ "status": "owned" })));
+    assert!(
+        !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the dropped rows leave no busy evidence"
+    );
+    let latest = latest_record(&worker);
+    assert_eq!(latest.operation, "queue_dropped");
+    let (steering, follow_up, _) = WorkerRecoveryJournal::read_queue_snapshot(
+        &worker.config.recovery_journal_path,
+        "target-session",
+    )
+    .unwrap()
+    .expect("the drop flushed its snapshot");
+    assert!(
+        steering.is_empty() && follow_up.is_empty(),
+        "lanes: {steering:?} {follow_up:?}"
+    );
+    let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+}
+
+/// The in-flight turn is live work: only its own `turn_end` (after the idle flip) settles it.
+#[tokio::test]
+async fn mid_turn_withdrawal_keeps_the_in_flight_turn_busy() {
+    let worker = created_worker_with_journal().await;
+    // Mid-turn: the runner is streaming, and the withdrawal leaves
+    // nothing queued behind it.
+    worker.core.lock().unwrap().busy = true;
+    worker.dispatch("clear_queue", &json!({})).await;
+    let latest = latest_record(&worker);
+    assert_eq!(latest.operation, "queue_cleared");
+    assert!(
+        latest.busy,
+        "the in-flight turn keeps the withdrawal's verdict busy"
+    );
+    let (steering, follow_up, _) = WorkerRecoveryJournal::read_queue_snapshot(
+        &worker.config.recovery_journal_path,
+        "target-session",
+    )
+    .unwrap()
+    .expect("the withdrawal flushed its snapshot");
+    assert!(
+        steering.is_empty() && follow_up.is_empty(),
+        "the withdrawn rows left the snapshot: {steering:?} {follow_up:?}"
+    );
+    // The turn ends: the runner's idle flip precedes its settle, so the
+    // same empty lanes now record busy=false.
+    worker.core.lock().unwrap().busy = false;
+    worker.dispatch("clear_queue", &json!({})).await;
+    let latest = latest_record(&worker);
+    assert_eq!(latest.operation, "queue_cleared");
+    assert!(!latest.busy, "the settled turn leaves the session idle");
+    assert!(
+        !WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),
+        "the settled session proves nothing"
+    );
+    let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+}
+
+/// Factory milestones are actual internal queue admissions, including after
+/// journal restore; they never outrank or become a genuine human correction.
+#[tokio::test]
+async fn factory_progress_keeps_human_priority_and_restored_internal_provenance() {
+    let worker = created_worker_with_journal().await;
+    worker.dispatch("clear_queue", &json!({})).await;
+    worker.core.lock().unwrap().busy = true;
+    let human = worker
+        .dispatch(
+            "prompt",
+            &json!({"message":"genuine human scope","streamingBehavior":"steer"}),
+        )
+        .await;
+    assert!(human.success, "{human:?}");
+    let row = pa_core::session_engine::messages::create_factory_progress_message(
+        "owned-run",
+        "paused",
+        /*node*/ None,
+        "requires owner review",
+        1,
+    );
+    admit_kernel_notice(
+        &worker.recovery,
+        &worker.core,
+        &Arc::new(Notify::new()),
+        crate::engine::KernelNotice {
+            row,
+            preview_label: pa_core::session_engine::messages::FACTORY_PROGRESS_PREVIEW_LABEL,
+        },
+        || false,
+    );
+    let expected = {
+        let core = worker.core.lock().unwrap();
+        assert_eq!(core.steering.len(), 2);
+        let human = &core.steering[0];
+        let notice = &core.steering[1];
+        assert_eq!(
+            (human.priority, notice.priority),
+            (QueuePriority::Human, QueuePriority::Background)
+        );
+        let row = notice.custom_message.as_ref().expect("internal custom row");
+        assert_eq!(
+            (&row["role"], &row["customType"], &row["details"]["runId"]),
+            (
+                &json!("custom"),
+                &json!("factory_progress_notice"),
+                &json!("owned-run")
+            )
+        );
+        assert!(
+            notice.input_identity.is_none(),
+            "internal notice has no human authority"
+        );
+        core.steering
+            .iter()
+            .map(|item| {
+                (
+                    item.message.clone(),
+                    item.priority,
+                    item.custom_message.clone(),
+                    item.input_identity.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let restored = {
+        let journal = worker.recovery.lock().unwrap();
+        let (steering, follow_up, _suspended) =
+            restore_queue_snapshot(journal.as_ref().unwrap(), "target-session");
+        assert!(follow_up.is_empty());
+        steering
+            .into_iter()
+            .map(|item| {
+                (
+                    item.message,
+                    item.priority,
+                    item.custom_message,
+                    item.input_identity,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        restored, expected,
+        "restart retains provenance and authority order"
+    );
+    let _ = std::fs::remove_dir_all(worker.config.socket_path.parent().unwrap());
+}

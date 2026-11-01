@@ -1,0 +1,3 @@
+- Add the daemon `edit_goal_objective` command with goal identity and expected-objective checks. A changed objective is persisted by the session goal driver and announced as `goal_update`; unchanged edits stay silent.
+- A running active goal receives a refreshed objective context on its next turn. Editing a paused or completed goal does not resume it or start a model turn.
+- Goal time accounting follows active runtime intervals: restored and paused goals keep their persisted seconds, and resume does not charge paused downtime.

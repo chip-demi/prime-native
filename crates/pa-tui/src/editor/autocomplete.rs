@@ -1,0 +1,329 @@
+//! Editor autocomplete integration: slash-command and file/path completion via
+//! the configured provider.
+
+use std::sync::mpsc::TryRecvError;
+
+use super::text_utils::{char_prefix, ends_with_symbol_token};
+use super::{AutocompleteSearch, Editor, EditorEvent, PendingAutocomplete};
+
+impl Editor {
+    pub(crate) fn current_slash_command_context(
+        &self,
+    ) -> Option<crate::autocomplete::SlashContext> {
+        crate::autocomplete::get_slash_command_context(
+            &self.lines,
+            self.cursor_line,
+            self.cursor_col,
+        )
+    }
+
+    /// The `/command <partial>` argument context at the prompt start, when
+    /// the cursor sits in the argument text of a recognized command token:
+    /// the command name plus the typed partial. Tab interception uses this
+    /// to open a picker-command's menu filtered to the partial.
+    #[must_use]
+    pub fn picker_argument_context(&self) -> Option<(String, String)> {
+        let context = self.current_slash_command_context()?;
+        if context.kind != crate::autocomplete::SlashKind::Argument || !context.at_prompt_start {
+            return None;
+        }
+        // The context only reports text up to the cursor, so a cursor
+        // inside the argument (`/model g|p`) would filter the picker on
+        // the head and leave the tail behind on accept. Only intercept
+        // when the cursor sits at the argument's end.
+        let line: Vec<char> = self.lines[self.cursor_line].chars().collect();
+        let remainder = &line[self.cursor_col.min(line.len())..];
+        if remainder.iter().any(|c| !c.is_whitespace()) {
+            return None;
+        }
+        // Applying from the picker clears the editor (the command is
+        // fulfilled), so draft text on a later line would be silently
+        // discarded with it. Only intercept when every line below the
+        // cursor's is whitespace.
+        let later_line_has_text = self
+            .lines
+            .iter()
+            .skip(self.cursor_line + 1)
+            .any(|line| line.chars().any(|c| !c.is_whitespace()));
+        if later_line_has_text {
+            return None;
+        }
+        context.command_name.map(|name| (name, context.prefix))
+    }
+
+    pub(crate) fn is_slash_name_completion_at_prompt_start(&self) -> bool {
+        let ctx = self.current_slash_command_context();
+        let kind_slash = self
+            .autocomplete
+            .as_ref()
+            .is_some_and(|s| s.kind == Some(crate::autocomplete::SuggestionKind::SlashCommand));
+        let default_slash = self.autocomplete.is_some()
+            && self.autocomplete.as_ref().unwrap().prefix.starts_with('/');
+        (kind_slash || default_slash)
+            && matches!(ctx, Some(c) if c.kind == crate::autocomplete::SlashKind::Name && c.at_prompt_start)
+    }
+
+    pub(crate) fn apply_completion(
+        &self,
+        item: &crate::autocomplete::CompletionItem,
+        prefix: &str,
+    ) -> crate::autocomplete::CompletionResult {
+        match self.autocomplete_provider.as_ref() {
+            Some(provider) => provider.apply_completion(
+                &self.lines,
+                self.cursor_line,
+                self.cursor_col,
+                item,
+                prefix,
+            ),
+            None => crate::autocomplete::CompletionResult {
+                lines: self.lines.clone(),
+                cursor_line: self.cursor_line,
+                cursor_col: self.cursor_col,
+            },
+        }
+    }
+
+    pub(crate) fn handle_tab_completion(&mut self) {
+        if self.autocomplete_provider.is_none() {
+            return;
+        }
+        // An empty prompt has nothing to complete: the forced file pass
+        // would otherwise list the whole cwd, a junk menu with no anchor
+        // token.
+        if self.get_text().trim().is_empty() {
+            return;
+        }
+        if matches!(self.current_slash_command_context(), Some(c) if c.kind == crate::autocomplete::SlashKind::Name)
+        {
+            self.request_autocomplete(false, true);
+        } else {
+            self.request_autocomplete(true, true);
+        }
+    }
+
+    pub(crate) fn maybe_autocomplete_after_insert(&mut self, ch: &str) {
+        if self.autocomplete.is_none() {
+            let slash_ctx = self.current_slash_command_context();
+            let c = ch.chars().next().unwrap_or(' ');
+            let slash_name_slash = c == '/'
+                && matches!(&slash_ctx, Some(ctx) if ctx.kind == crate::autocomplete::SlashKind::Name);
+            let slash_word_char =
+                slash_ctx.is_some() && (c.is_ascii_alphanumeric() || ".-_".contains(c));
+            if slash_name_slash || slash_word_char {
+                self.request_autocomplete(false, false);
+            } else {
+                self.request_autocomplete_in_symbol_token();
+            }
+        } else {
+            self.refresh_autocomplete_after_edit(false);
+        }
+    }
+
+    /// Request suggestions when the cursor ends an `@`/`#` token: any edit
+    /// inside it — a `/` too, and a completion that keeps it open (an
+    /// applied directory, `@src/`) — lists what the token now matches.
+    pub(crate) fn request_autocomplete_in_symbol_token(&mut self) {
+        if self.cursor_ends_symbol_token() {
+            self.request_autocomplete(false, false);
+        }
+    }
+
+    fn cursor_ends_symbol_token(&self) -> bool {
+        let before = char_prefix(&self.lines[self.cursor_line], self.cursor_col);
+        ends_with_symbol_token(&before)
+            || crate::autocomplete::extract_at_prefix(&before.chars().collect::<Vec<_>>()).is_some()
+    }
+
+    pub(crate) fn request_autocomplete(&mut self, force: bool, explicit_tab: bool) {
+        let Some(provider) = self.autocomplete_provider.as_ref() else {
+            return;
+        };
+        if force {
+            let should = provider.should_trigger_file_completion(
+                &self.lines,
+                self.cursor_line,
+                self.cursor_col,
+            );
+            if !should {
+                return;
+            }
+        }
+        // A new request aborts the in-flight search (TS cancels the
+        // previous lookup at request time): dropping the handle sets
+        // its cancel flag and the walk quits.
+        self.autocomplete_search = None;
+        self.pending_autocomplete = Some(PendingAutocomplete {
+            force,
+            explicit_tab,
+        });
+    }
+
+    /// Materialize the parked suggestion request. The host loop calls
+    /// this once the input queue drains, so a keystroke burst never sees
+    /// a dropdown open mid-batch; a background `@` search is polled
+    /// here too.
+    pub fn materialize_autocomplete(&mut self) {
+        if let Some(pending) = self.pending_autocomplete.take() {
+            self.run_autocomplete_request(pending);
+            return;
+        }
+        let Some(active) = self.autocomplete_search.take() else {
+            return;
+        };
+        // The editor moved past the snapshot the search answers, so the
+        // result would land stale — drop the handle (cancelling the
+        // walk) without touching the UI.
+        if self.lines != active.lines
+            || self.cursor_line != active.cursor_line
+            || self.cursor_col != active.cursor_col
+        {
+            return;
+        }
+        // An empty channel keeps the search running for the next tick; a
+        // closed one (a panicked walk thread) reads as no suggestions.
+        let result = match active.search.results.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => {
+                self.autocomplete_search = Some(active);
+                return;
+            }
+            Err(TryRecvError::Disconnected) => None,
+        };
+        self.apply_suggestions(result, active.request);
+    }
+
+    fn run_autocomplete_request(&mut self, request: PendingAutocomplete) {
+        let Some(provider) = self.autocomplete_provider.as_ref() else {
+            return;
+        };
+        match provider.get_suggestions(
+            &self.lines,
+            self.cursor_line,
+            self.cursor_col,
+            request.force,
+        ) {
+            Some(crate::autocomplete::SuggestionLookup::Searching(search)) => {
+                self.autocomplete_search = Some(AutocompleteSearch {
+                    search,
+                    request,
+                    lines: self.lines.clone(),
+                    cursor_line: self.cursor_line,
+                    cursor_col: self.cursor_col,
+                });
+            }
+            Some(crate::autocomplete::SuggestionLookup::Ready(suggestions)) => {
+                self.apply_suggestions(Some(suggestions), request);
+            }
+            None => self.apply_suggestions(None, request),
+        }
+    }
+
+    /// Apply a resolved lookup: no items cancels the open menu, a forced
+    /// Tab with a single item applies it inline, and otherwise the
+    /// dropdown opens with the best match selected.
+    fn apply_suggestions(
+        &mut self,
+        suggestions: Option<crate::autocomplete::Suggestions>,
+        request: PendingAutocomplete,
+    ) {
+        let Some(suggestions) = suggestions else {
+            self.cancel_autocomplete();
+            return;
+        };
+        if suggestions.items.is_empty() {
+            self.cancel_autocomplete();
+            return;
+        }
+        if request.force && request.explicit_tab && suggestions.items.len() == 1 {
+            let item = suggestions.items[0].clone();
+            self.push_undo_snapshot();
+            self.last_action = None;
+            let prefix = suggestions.prefix;
+            let result = self.apply_completion(&item, &prefix);
+            self.lines = result.lines;
+            self.cursor_line = result.cursor_line;
+            self.set_cursor_col(result.cursor_col);
+            self.request_autocomplete_in_symbol_token();
+            self.emit(EditorEvent::Changed(self.get_text()));
+            return;
+        }
+        let matching_prefix =
+            if suggestions.kind == Some(crate::autocomplete::SuggestionKind::SlashCommand) {
+                suggestions
+                    .prefix
+                    .strip_prefix('/')
+                    .unwrap_or(&suggestions.prefix)
+                    .to_string()
+            } else {
+                suggestions.prefix.clone()
+            };
+        let mut state = crate::autocomplete::AutocompleteState::new(
+            suggestions.items,
+            5,
+            suggestions.prefix.clone(),
+            suggestions.kind,
+        );
+        if let Some(idx) = state.best_match_index(&matching_prefix) {
+            state.set_selected_index(idx);
+        }
+        let was_showing = self.autocomplete.is_some();
+        self.autocomplete = Some(state);
+        if was_showing != self.autocomplete.is_some() {
+            self.emit(EditorEvent::AutocompleteToggled(
+                self.autocomplete.is_some(),
+            ));
+        }
+    }
+
+    pub(crate) fn refresh_autocomplete_after_edit(&mut self, retrigger: bool) {
+        let has_ctx =
+            self.current_slash_command_context().is_some() || self.cursor_ends_symbol_token();
+
+        // An edit that empties the prompt cancels both the open menu and the
+        // parked request (a parked request can exist without an open menu; if it
+        // survived, it would materialize a dropdown on an empty prompt).
+        if self.get_text().trim().is_empty() {
+            self.cancel_autocomplete();
+            return;
+        }
+        if self.autocomplete.is_some() {
+            let force = self.autocomplete.as_ref().is_some_and(|s| s.forced);
+            self.request_autocomplete(force, false);
+            return;
+        }
+        if retrigger && has_ctx {
+            self.request_autocomplete(false, false);
+        }
+    }
+
+    pub fn cancel_autocomplete(&mut self) {
+        let was = self.autocomplete.is_some();
+        self.autocomplete = None;
+        self.pending_autocomplete = None;
+        self.autocomplete_search = None;
+        if was {
+            self.emit(EditorEvent::AutocompleteToggled(false));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Editor {
+    /// Wait for the actual search response, with a failure deadline rather than idle polling.
+    pub(super) fn settle_autocomplete_search(&mut self) {
+        while self.has_pending_autocomplete() {
+            if self.pending_autocomplete.is_some() {
+                self.materialize_autocomplete();
+            }
+            if let Some(active) = self.autocomplete_search.take() {
+                let result = active
+                    .search
+                    .results
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("autocomplete search must send its result");
+                self.apply_suggestions(result, active.request);
+            }
+        }
+    }
+}

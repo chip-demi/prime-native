@@ -1,0 +1,2 @@
+- Native `rlm.spawn` reads Studio's optional project subagent policy at spawn time. Project settings override global defaults, and explicit model or thinking arguments override either default.
+- Missing policy configuration keeps native inheritance. Invalid or unreadable policy fails the spawn before creating a child; selected models still pass the existing catalog, allowlist, and thinking compatibility checks.

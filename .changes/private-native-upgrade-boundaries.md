@@ -1,0 +1,1 @@
+- Preserve private child admission and update safety behind focused native modules, with reproducible compatibility checks for upstream upgrades.

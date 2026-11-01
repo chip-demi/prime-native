@@ -1,0 +1,733 @@
+//! The settings-menu unit battery: the tab partitioning, the key loop,
+//! the submenu previews, the filter, and the render shapes.
+use super::*;
+use crate::keybindings::KeybindingsManager;
+
+fn kb() -> KeybindingsManager {
+    KeybindingsManager::new()
+}
+
+fn menu() -> SettingsMenu {
+    let values = SettingsCurrentValues {
+        autocompact: true,
+        steering_mode: "all".to_string(),
+        available_thinking_levels: vec!["low".to_string(), "high".to_string()],
+        thinking_level: Some("low".to_string()),
+        available_themes: vec!["prime".to_string(), "dark".to_string()],
+        theme: "prime".to_string(),
+        idle_eviction_minutes: "90".to_string(),
+        ..Default::default()
+    };
+    SettingsMenu::new(settings_menu_rows(&values))
+}
+
+fn render_text(menu: &SettingsMenu) -> Vec<String> {
+    let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::Color256);
+    menu.render(&theme, 100, &KeybindingsManager::new())
+        .iter()
+        .map(|line| line.iter().map(|span| span.content.as_str()).collect())
+        .collect()
+}
+
+#[test]
+fn tabs_partition_the_settings_rows() {
+    let menu = menu();
+    let tabs: Vec<(&str, Vec<&str>)> = menu
+        .tabs
+        .iter()
+        .map(|tab| {
+            (
+                tab.name,
+                tab.rows.iter().map(|&index| menu.rows[index].id).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tabs,
+        vec![
+            (
+                "General",
+                vec![
+                    "autocompact",
+                    "steering-mode",
+                    "follow-up-mode",
+                    "quiet-startup",
+                    "warnings",
+                    "autocompact-threshold"
+                ]
+            ),
+            (
+                "Models",
+                vec!["thinking", "transport", "default-service-tier"]
+            ),
+            (
+                "Display",
+                vec![
+                    "theme",
+                    "terminal-progress",
+                    "clear-on-shrink",
+                    "show-images",
+                    "auto-resize-images",
+                    "block-images",
+                    "mermaid-rendering"
+                ]
+            ),
+            (
+                "Editor",
+                vec![
+                    "editor-padding",
+                    "autocomplete-max-visible",
+                    "show-hardware-cursor"
+                ]
+            ),
+            (
+                "Agents",
+                vec![
+                    "skill-commands",
+                    "builtin-skills",
+                    "idle-eviction-minutes",
+                    "tree-filter-mode",
+                    "harness-refinements",
+                ]
+            ),
+        ]
+    );
+    let grouped: usize = menu.tabs.iter().map(|tab| tab.rows.len()).sum();
+    assert_eq!(grouped, menu.rows.len());
+}
+
+#[test]
+fn an_empty_row_set_keeps_the_empty_state_and_closes() {
+    let mut menu = SettingsMenu::new(Vec::new());
+    // No tab state exists: the navigation keys no-op, never panic.
+    assert_eq!(menu.handle_key("down", &kb()), SettingsMenuAction::None);
+    assert_eq!(menu.handle_key("2", &kb()), SettingsMenuAction::None);
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("No settings available")));
+    assert!(text
+        .iter()
+        .any(|row| { row.contains("Type to search · ←/→/Enter/Space change · Esc close") }));
+    assert_eq!(menu.handle_key("esc", &kb()), SettingsMenuAction::Cancel);
+}
+
+#[test]
+fn confirm_cycles_values_and_reports_the_change() {
+    let mut menu = menu();
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "autocompact",
+            value: "false".to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "autocompact",
+            value: "true".to_string()
+        }
+    );
+}
+
+#[test]
+fn enter_opens_the_thinking_submenu_and_selection_applies() {
+    let mut menu = menu();
+    // 2 jumps to the Models tab (thinking lives there).
+    menu.handle_key("2", &kb());
+    assert_eq!(menu.handle_key("enter", &kb()), SettingsMenuAction::None);
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("Thinking Level")));
+    assert!(text
+        .iter()
+        .any(|row| row.contains("Select reasoning depth for thinking-capable models")));
+    menu.handle_key("down", &kb());
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "thinking",
+            value: "high".to_string()
+        }
+    );
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| {
+        row.contains("Type to search · Tab/1-5 tabs · ←/→/Enter/Space change · Esc close")
+    }));
+}
+
+#[test]
+fn theme_submenu_previews_and_esc_restores() {
+    let mut menu = menu();
+    // 3 jumps to the Display tab (theme leads it).
+    menu.handle_key("3", &kb());
+    menu.handle_key("enter", &kb());
+    assert_eq!(
+        menu.handle_key("down", &kb()),
+        SettingsMenuAction::PreviewTheme {
+            name: "dark".to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("esc", &kb()),
+        SettingsMenuAction::RestoreTheme {
+            name: "prime".to_string()
+        }
+    );
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("Theme")));
+}
+
+#[test]
+fn enter_opens_the_service_tier_submenu_preselected_and_selection_applies() {
+    let values = SettingsCurrentValues {
+        default_service_tier: "flex".to_string(),
+        ..Default::default()
+    };
+    let mut menu = SettingsMenu::new(settings_menu_rows(&values));
+    // 2 jumps to the Models tab; two downs reach the tier row
+    // (thinking, transport, default-service-tier).
+    menu.handle_key("2", &kb());
+    menu.handle_key("down", &kb());
+    menu.handle_key("down", &kb());
+    assert_eq!(menu.handle_key("enter", &kb()), SettingsMenuAction::None);
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("Default Service Tier")));
+    assert!(text
+        .iter()
+        .any(|row| row.contains("Cheaper, slower, may hit capacity limits")));
+    // The submenu preselects the current value (flex, the second option).
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "default-service-tier",
+            value: "flex".to_string()
+        }
+    );
+    assert_eq!(menu.handle_key("enter", &kb()), SettingsMenuAction::None);
+    menu.handle_key("down", &kb());
+    menu.handle_key("down", &kb());
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "default-service-tier",
+            value: "auto".to_string()
+        }
+    );
+    assert_eq!(menu.handle_key("enter", &kb()), SettingsMenuAction::None);
+    assert_eq!(
+        menu.handle_key("esc", &kb()),
+        SettingsMenuAction::SubmenuClosed
+    );
+    let text = render_text(&menu);
+    assert!(text
+        .iter()
+        .any(|row| row.contains("Enter/Space change · Esc close")));
+}
+
+#[test]
+fn typing_filters_the_active_tab_and_esc_cancels() {
+    let mut menu = menu();
+    // 2 jumps to the Models tab (thinking + transport).
+    menu.handle_key("2", &kb());
+    for key in ["t", "r", "a", "n", "s", "p"] {
+        menu.handle_key(key, &kb());
+    }
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("Transport")));
+    assert!(!text.iter().any(|row| row.contains("Thinking")));
+    assert_eq!(menu.handle_key("esc", &kb()), SettingsMenuAction::Cancel);
+}
+
+#[test]
+fn switching_tabs_shows_that_tabs_settings() {
+    let mut menu = menu();
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Auto-compact")));
+    // 4 jumps to the Editor tab.
+    menu.handle_key("4", &kb());
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("Editor padding")));
+    assert!(text
+        .iter()
+        .any(|row| row.contains("Autocomplete max items")));
+    assert!(text.iter().any(|row| row.contains("Show hardware cursor")));
+    assert!(!text.iter().any(|row| row.contains("Auto-compact")));
+    assert!(!text.iter().any(|row| row.contains("Theme")));
+}
+
+#[test]
+fn arrows_cycle_values_and_the_tab_keys_switch_tabs() {
+    let mut menu = menu();
+    // The arrows cycle the focused row's value (the operator's 2026-09-28
+    // rebind): right flips Auto-compact without leaving the General tab.
+    assert_eq!(
+        menu.handle_key("right", &kb()),
+        SettingsMenuAction::Change {
+            id: "autocompact",
+            value: "false".to_string()
+        }
+    );
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Auto-compact")));
+    assert_eq!(
+        menu.handle_key("left", &kb()),
+        SettingsMenuAction::Change {
+            id: "autocompact",
+            value: "true".to_string()
+        }
+    );
+    // The arrows never switch tabs: after three rights the General tab still
+    // owns the frame.
+    for _ in 0..3 {
+        menu.handle_key("right", &kb());
+    }
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Steering mode")));
+    assert!(!render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Transport")));
+    menu.handle_key("tab", &kb());
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Transport")));
+    menu.handle_key("shift+tab", &kb());
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Auto-compact")));
+    menu.handle_key("5", &kb());
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Skill commands")));
+    menu.handle_key("tab", &kb());
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Auto-compact")));
+}
+
+#[test]
+fn arrows_cycle_a_multi_option_row_in_place() {
+    let mut menu = menu();
+    // 2 jumps to the Models tab; down reaches Transport (a four-value row).
+    menu.handle_key("2", &kb());
+    menu.handle_key("down", &kb());
+    // The unset default means right lands on the list's first option.
+    assert_eq!(
+        menu.handle_key("right", &kb()),
+        SettingsMenuAction::Change {
+            id: "transport",
+            value: "sse".to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("right", &kb()),
+        SettingsMenuAction::Change {
+            id: "transport",
+            value: "websocket".to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("right", &kb()),
+        SettingsMenuAction::Change {
+            id: "transport",
+            value: "websocket-cached".to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("left", &kb()),
+        SettingsMenuAction::Change {
+            id: "transport",
+            value: "websocket".to_string()
+        }
+    );
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("websocket")));
+    // Enter keeps its cycle: the next value after websocket.
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "transport",
+            value: "websocket-cached".to_string()
+        }
+    );
+}
+
+#[test]
+fn arrows_no_op_on_submenu_rows() {
+    let mut menu = menu();
+    // Thinking level is a submenu row — the arrows change nothing.
+    menu.handle_key("2", &kb());
+    assert_eq!(menu.handle_key("right", &kb()), SettingsMenuAction::None);
+    assert_eq!(menu.handle_key("left", &kb()), SettingsMenuAction::None);
+    assert_eq!(menu.handle_key("enter", &kb()), SettingsMenuAction::None);
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("Thinking Level")));
+}
+
+/// A caret-only key in the search field keeps the filtered selection
+/// (the config selector's re-filter rule: the filter re-runs only when
+/// the query changed), so the row Space would activate stays the one
+/// under the cursor.
+#[test]
+fn a_caret_move_keeps_the_filtered_selection() {
+    let mut menu = menu();
+    // "mo" leaves two rows (steering-mode, follow-up-mode).
+    for key in ["m", "o"] {
+        menu.handle_key(key, &kb());
+    }
+    assert!(menu.tabs[menu.tab].filtered.len() >= 2);
+    menu.handle_key("down", &kb());
+    let selected = menu.tabs[menu.tab].selected;
+    assert!(selected > 0);
+    // A caret move edits nothing: the selection stays on the row.
+    menu.handle_key("ctrl+left", &kb());
+    assert_eq!(
+        menu.tabs[menu.tab].selected, selected,
+        "a caret-only key keeps the selection"
+    );
+}
+
+/// A paste on the empty-menu state (no tabs) is a no-op, like the
+/// navigation keys: nothing panics, nothing types.
+#[test]
+fn a_paste_on_an_empty_menu_edits_nothing() {
+    let mut menu = SettingsMenu::new(Vec::new());
+    menu.paste("anything");
+    assert!(menu.tabs.is_empty());
+}
+
+/// A paste while a submenu owns the frame edits nothing: the parent
+/// list's search stays untouched behind it.
+#[test]
+fn a_paste_while_a_submenu_is_open_edits_nothing() {
+    let mut menu = menu();
+    menu.handle_key("2", &kb());
+    menu.handle_key("enter", &kb());
+    assert!(menu.sub.is_some());
+    menu.paste("thinking");
+    assert_eq!(menu.tabs[menu.tab].search.value(), "");
+}
+
+/// A paste lands in the search field (TS routes the raw paste to the
+/// `Input`): TS's sanitize strips the spaces (Space stays the row
+/// activation), the filter re-runs on the changed query.
+#[test]
+fn a_paste_types_into_the_search_query_without_spaces() {
+    let mut menu = menu();
+    menu.paste("auto comp");
+    assert_eq!(menu.tabs[menu.tab].search.value(), "autocomp");
+    assert_eq!(menu.tabs[menu.tab].filtered.len(), 2);
+    assert_eq!(menu.rows[menu.tabs[menu.tab].filtered[0]].id, "autocompact");
+    assert_eq!(
+        menu.rows[menu.tabs[menu.tab].filtered[1]].id,
+        "autocompact-threshold"
+    );
+}
+
+#[test]
+fn digits_type_into_an_active_query() {
+    let mut menu = menu();
+    // With an active query, digits are search text: 2 does not jump
+    // to the Models tab (a jump would clear the search).
+    menu.handle_key("s", &kb());
+    menu.handle_key("2", &kb());
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("s2")));
+    assert!(text.iter().any(|row| row.contains("No matching settings")));
+}
+
+#[test]
+fn switching_tabs_keeps_each_tabs_search_and_selection() {
+    let mut menu = menu();
+    menu.handle_key("down", &kb());
+    menu.handle_key("2", &kb());
+    menu.handle_key("1", &kb());
+    assert_eq!(
+        menu.handle_key("enter", &kb()),
+        SettingsMenuAction::Change {
+            id: "steering-mode",
+            value: "one-at-a-time".to_string()
+        }
+    );
+    // Each tab keeps its own query: the filter and the field still hold after
+    // the round trip; tab switches even under an active query.
+    for key in ["w", "a", "r", "n"] {
+        menu.handle_key(key, &kb());
+    }
+    menu.handle_key("tab", &kb());
+    assert!(render_text(&menu)
+        .iter()
+        .any(|row| row.contains("Transport")));
+    menu.handle_key("shift+tab", &kb());
+    let text = render_text(&menu);
+    assert!(text.iter().any(|row| row.contains("warn")));
+    assert!(text.iter().any(|row| row.contains("Warnings")));
+    assert!(!text.iter().any(|row| row.contains("Quiet startup")));
+}
+
+#[test]
+fn the_strip_lists_the_tabs_and_marks_the_active_one() {
+    let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::Color256);
+    let lines = menu().render(&theme, 100, &KeybindingsManager::new());
+    // The strip rides under the search field with a blank row on
+    // either side (the operator's 2026-09-28 spacing pass).
+    let strip_blank_above: String = lines[3].iter().map(|span| span.content.as_str()).collect();
+    assert_eq!(strip_blank_above, "");
+    let text: String = lines[4].iter().map(|span| span.content.as_str()).collect();
+    assert_eq!(
+        text,
+        "  1 General    2 Models    3 Display    4 Editor    5 Agents"
+    );
+    let strip_blank_below: String = lines[5].iter().map(|span| span.content.as_str()).collect();
+    assert_eq!(strip_blank_below, "");
+    // The active tab renders white bold (the operator's 2026-09-28 selection ruling — the theme's
+    // text color, not the dock's background band).
+    let active = lines[4]
+        .iter()
+        .find(|span| span.content == "General")
+        .expect("the active tab renders");
+    assert_eq!(
+        active.style,
+        theme
+            .fg_style(ThemeColor::Text)
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    );
+    let inactive = lines[4]
+        .iter()
+        .find(|span| span.content == "Models")
+        .expect("an inactive tab renders");
+    assert_eq!(inactive.style, theme.fg_style(ThemeColor::Muted));
+}
+
+#[test]
+fn the_header_and_the_settings_list_breathe_apart() {
+    let text = render_text(&menu());
+    // The search field: [rule, field, rule]; then the spacing pass's blank row under the field, the
+    // strip, and the blank row below the tabs before the settings list begins (the operator's
+    // 2026-09-28 spacing directives 1 + 2).
+    assert_eq!(text[0], "\u{2500}".repeat(100));
+    assert!(text[1].starts_with(" >  Search settings"));
+    assert_eq!(text[2], "\u{2500}".repeat(100));
+    assert_eq!(text[3], "");
+    assert_eq!(
+        text[4],
+        "  1 General    2 Models    3 Display    4 Editor    5 Agents"
+    );
+    assert_eq!(text[5], "");
+    assert!(text[6].starts_with("\u{203a} Auto-compact"));
+}
+
+#[test]
+fn render_shows_value_and_selected_description() {
+    let text = render_text(&menu());
+    assert!(text.iter().any(|row| row.contains("Auto-compact")));
+    assert!(text
+        .iter()
+        .any(|row| row.contains("Automatically compact context when it gets too large")));
+    assert!(text.iter().any(|row| {
+        row.contains("Type to search · Tab/1-5 tabs · ←/→/Enter/Space change · Esc close")
+    }));
+    let selected = text
+        .iter()
+        .find(|row| row.starts_with("\u{203a}"))
+        .expect("the selected row carries the marker");
+    assert!(selected.contains("Auto-compact"));
+    assert!(selected.contains("true"));
+    // The separator rule rides between the description and the hint row (the operator's 2026-09-28
+    // directive), and the hint row carries the description's two-space padding-x.
+    let hint_index = text
+        .iter()
+        .position(|row| row.starts_with("  Type to search"))
+        .expect("the hint row renders with its padding");
+    assert_eq!(text[hint_index - 1], "\u{2500}".repeat(100));
+    let description_index = text
+        .iter()
+        .position(|row| row.starts_with("  Automatically compact"))
+        .expect("the description renders with its padding");
+    assert_eq!(text[description_index + 1], "\u{2500}".repeat(100));
+}
+
+#[test]
+fn opening_into_a_setting_keeps_the_top_bar_and_the_padding() {
+    let mut menu = menu();
+    // Enter opens the Thinking level submenu (the open-into-a-setting path).
+    menu.handle_key("2", &kb());
+    menu.handle_key("enter", &kb());
+    let text = render_text(&menu);
+    // The top bar stays over the submenu (the operator's 2026-09-28 regression
+    // pin a).
+    assert_eq!(text[0], "\u{2500}".repeat(100));
+    // The name and description keep the list rows' padding-x (regression pin b).
+    assert_eq!(text[1], "  Thinking Level");
+    assert!(text[3].starts_with("  Select reasoning depth"));
+    assert!(text
+        .iter()
+        .any(|row| row.starts_with("  Enter select · Esc back")));
+}
+
+/// The search field takes the WHOLE key id (TS `Input.handleInput`, the
+/// `SettingsList.handleInput` final arm): Backspace deletes the query.
+/// After garbage filters the list to the no-match row, backspacing it
+/// away returns the settings rows.
+#[test]
+fn backspace_edits_the_search_query() {
+    let mut menu = menu();
+    for key in ["z", "q", "x"] {
+        menu.handle_key(key, &kb());
+    }
+    let filtered = render_text(&menu);
+    assert!(
+        filtered
+            .iter()
+            .any(|row| row.contains("No matching settings")),
+        "the garbage query filters the list to the no-match row"
+    );
+    assert!(
+        !filtered.iter().any(|row| row.contains("Auto-compact")),
+        "no settings row matches the garbage query"
+    );
+    for _ in 0..3 {
+        menu.handle_key("backspace", &kb());
+    }
+    let text = render_text(&menu);
+    assert!(
+        text.iter().any(|row| row.contains("Auto-compact")),
+        "the settings rows return once the query is backspaced away"
+    );
+    assert!(
+        !text.iter().any(|row| row.contains("No matching settings")),
+        "the no-match row clears with the query"
+    );
+}
+
+/// Backspace at the empty-query boundary stays inside the menu (TS
+/// `Input.handleBackspace` clamps at the cursor): the action is None
+/// and the rows keep rendering — the menu neither closes nor strands on
+/// its no-match row. Like every key that reaches the search field, the
+/// press runs the filter pass, which re-lands the tab's selection on its
+/// first row (TS `applyFilter`'s reset, kept for parity).
+#[test]
+fn backspace_on_an_empty_query_keeps_the_menu_open() {
+    let mut menu = menu();
+    assert_eq!(
+        menu.handle_key("backspace", &kb()),
+        SettingsMenuAction::None,
+        "backspace with an empty query is a no-op action"
+    );
+    let text = render_text(&menu);
+    assert!(
+        text.iter().any(|row| row.contains("Auto-compact")),
+        "the rows keep rendering: {text:?}"
+    );
+    assert!(
+        !text.iter().any(|row| row.contains("No matching settings")),
+        "the empty query keeps every row matched"
+    );
+}
+
+/// Space keeps its row-activation meaning after the search field takes
+/// whole key ids (TS sanitizes a bare space out of the query): the key
+/// cycles the selected row's value and types nothing into the field.
+#[test]
+fn space_activates_instead_of_typing_into_the_query() {
+    let mut menu = menu();
+    let field_before = render_text(&menu)[1].clone();
+    assert_eq!(
+        menu.handle_key("space", &kb()),
+        SettingsMenuAction::Change {
+            id: "autocompact",
+            value: "false".to_string()
+        },
+        "Space cycles the selected row (the operator's key vocabulary)"
+    );
+    let field_after = render_text(&menu)[1].clone();
+    assert_eq!(
+        field_before, field_after,
+        "the sanitized Space never types into the search field"
+    );
+}
+
+#[test]
+fn harness_refinement_row_cycles_both_values_in_the_agents_tab() {
+    let values = SettingsCurrentValues {
+        harness_refinements: true,
+        ..SettingsCurrentValues::default()
+    };
+    let mut menu = SettingsMenu::new(settings_menu_rows(&values));
+    menu.handle_key("5", &kb());
+    for key in ["h", "a", "r", "n", "e", "s", "s"] {
+        menu.handle_key(key, &kb());
+    }
+    assert_eq!(
+        menu.handle_key("right", &kb()),
+        SettingsMenuAction::Change {
+            id: "harness-refinements",
+            value: "false".to_string()
+        }
+    );
+    assert_eq!(
+        menu.handle_key("left", &kb()),
+        SettingsMenuAction::Change {
+            id: "harness-refinements",
+            value: "true".to_string()
+        }
+    );
+}
+
+#[test]
+fn threshold_control_uses_five_point_steps_and_wraps_at_preset_boundaries() {
+    let values = SettingsCurrentValues {
+        compaction_threshold_percent: 95.0,
+        ..Default::default()
+    };
+    let mut menu = SettingsMenu::new(settings_menu_rows(&values));
+    menu.paste("threshold");
+    for (key, expected) in [
+        ("left", "90"),
+        ("left", "85"),
+        ("right", "90"),
+        ("right", "95"),
+        ("right", "100"),
+        ("right", "5"),
+        ("left", "100"),
+    ] {
+        assert_eq!(
+            menu.handle_key(key, &kb()),
+            SettingsMenuAction::Change {
+                id: "autocompact-threshold",
+                value: expected.into()
+            }
+        );
+    }
+}
+
+#[test]
+fn threshold_control_retains_off_grid_values_and_selects_neighbouring_presets() {
+    for (saved, lower, upper) in [
+        (62.5, "60", "65"),
+        (63.0, "60", "65"),
+        (1.0, "100", "5"),
+        (99.0, "95", "100"),
+    ] {
+        for (key, expected) in [("left", lower), ("right", upper)] {
+            let values = SettingsCurrentValues {
+                compaction_threshold_percent: saved,
+                ..Default::default()
+            };
+            let mut menu = SettingsMenu::new(settings_menu_rows(&values));
+            menu.paste("threshold");
+            assert!(render_text(&menu)
+                .iter()
+                .any(|row| row.contains(&saved.to_string())));
+            assert_eq!(
+                menu.handle_key(key, &kb()),
+                SettingsMenuAction::Change {
+                    id: "autocompact-threshold",
+                    value: expected.into()
+                }
+            );
+        }
+    }
+}

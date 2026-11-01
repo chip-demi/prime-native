@@ -1,0 +1,399 @@
+//! The interactive settings-menu accessors (TS settings-manager getters and setters behind the
+//! `/settings` rows). Every setter writes the global scope like the TS `markModified` + `save`
+//! pair; every getter reads the merged effective settings with the TS defaults.
+
+use anyhow::{anyhow, Result};
+
+use super::manager::SettingsManager;
+
+impl SettingsManager {
+    /// Global preference controlling refinement creation and context loading (default on).
+    /// Project settings cannot override the user's master switch.
+    #[must_use]
+    pub fn get_harness_refinements(&self) -> bool {
+        self.global_settings().harness_refinements.unwrap_or(true)
+    }
+
+    /// Persist the master harness switch to the global settings scope.
+    ///
+    /// # Errors
+    /// Returns an error when the global scope cannot be saved.
+    pub fn set_harness_refinements(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut().harness_refinements = Some(enabled);
+        self.save_global_scope(&["harnessRefinements"])
+    }
+
+    /// The percentage ceiling for automatic compaction (default 95%).
+    #[must_use]
+    pub fn get_compaction_threshold_percent(&self) -> f64 {
+        self.settings()
+            .compaction
+            .as_ref()
+            .and_then(|settings| settings.threshold_percent)
+            .filter(|percent| pa_types::compaction::is_valid_threshold_percent(*percent))
+            .unwrap_or(crate::session_engine::compaction::DEFAULT_THRESHOLD_PERCENT)
+    }
+
+    /// Persist the requested percentage without changing reserve or summary budgets.
+    ///
+    /// # Errors
+    /// Returns an error for values outside 1–100%, non-finite values, or a failed save.
+    pub fn set_compaction_threshold_percent(&mut self, percent: f64) -> Result<()> {
+        if !pa_types::compaction::is_valid_threshold_percent(percent) {
+            return Err(anyhow!(
+                "Auto-compact threshold must be a number from 1 to 100 percent"
+            ));
+        }
+        self.global_mut()
+            .compaction
+            .get_or_insert_with(Default::default)
+            .threshold_percent = Some(percent);
+        self.save_global_scope(&["compaction.thresholdPercent"])
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_show_images(&mut self, show: bool) -> Result<()> {
+        self.global_mut()
+            .terminal
+            .get_or_insert_with(Default::default)
+            .show_images = Some(show);
+        self.save_global_scope(&["terminal.showImages"])
+    }
+
+    /// `terminal.clearOnShrink` (TS default: the `PI_CLEAR_ON_SHRINK`
+    /// environment value; this port has no such override).
+    #[must_use]
+    pub fn get_clear_on_shrink(&self) -> bool {
+        self.settings()
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.clear_on_shrink)
+            .unwrap_or(false)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_clear_on_shrink(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut()
+            .terminal
+            .get_or_insert_with(Default::default)
+            .clear_on_shrink = Some(enabled);
+        self.save_global_scope(&["terminal.clearOnShrink"])
+    }
+
+    #[must_use]
+    pub fn get_show_terminal_progress(&self) -> bool {
+        self.settings()
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.show_terminal_progress)
+            .unwrap_or(false)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_show_terminal_progress(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut()
+            .terminal
+            .get_or_insert_with(Default::default)
+            .show_terminal_progress = Some(enabled);
+        self.save_global_scope(&["terminal.showTerminalProgress"])
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_fullscreen_mouse(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut()
+            .terminal
+            .get_or_insert_with(Default::default)
+            .fullscreen_mouse = Some(enabled);
+        self.save_global_scope(&["terminal.fullscreenMouse"])
+    }
+
+    #[must_use]
+    pub fn get_image_auto_resize(&self) -> bool {
+        self.settings()
+            .images
+            .as_ref()
+            .and_then(|images| images.auto_resize)
+            .unwrap_or(true)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_image_auto_resize(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut()
+            .images
+            .get_or_insert_with(Default::default)
+            .auto_resize = Some(enabled);
+        self.save_global_scope(&["images.autoResize"])
+    }
+
+    #[must_use]
+    pub fn get_block_images(&self) -> bool {
+        self.settings()
+            .images
+            .as_ref()
+            .and_then(|images| images.block_images)
+            .unwrap_or(false)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_block_images(&mut self, blocked: bool) -> Result<()> {
+        self.global_mut()
+            .images
+            .get_or_insert_with(Default::default)
+            .block_images = Some(blocked);
+        self.save_global_scope(&["images.blockImages"])
+    }
+
+    #[must_use]
+    pub fn get_enable_skill_commands(&self) -> bool {
+        self.settings().enable_skill_commands.unwrap_or(true)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_enable_skill_commands(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut().enable_skill_commands = Some(enabled);
+        self.save_global_scope(&["enableSkillCommands"])
+    }
+
+    #[must_use]
+    pub fn get_enable_builtin_skills(&self) -> bool {
+        self.settings().enable_builtin_skills.unwrap_or(true)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_enable_builtin_skills(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut().enable_builtin_skills = Some(enabled);
+        self.save_global_scope(&["enableBuiltinSkills"])
+    }
+
+    /// `showHardwareCursor` (TS default false; the `PI_HARDWARE_CURSOR`
+    /// override is not part of this port).
+    #[must_use]
+    pub fn get_show_hardware_cursor(&self) -> bool {
+        self.settings().show_hardware_cursor.unwrap_or(false)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_show_hardware_cursor(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut().show_hardware_cursor = Some(enabled);
+        self.save_global_scope(&["showHardwareCursor"])
+    }
+
+    #[must_use]
+    pub fn get_editor_padding_x(&self) -> u64 {
+        self.settings().editor_padding_x.unwrap_or(0)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_editor_padding_x(&mut self, padding: u64) -> Result<()> {
+        self.global_mut().editor_padding_x = Some(padding.min(3));
+        self.save_global_scope(&["editorPaddingX"])
+    }
+
+    #[must_use]
+    pub fn get_autocomplete_max_visible(&self) -> u64 {
+        self.settings().autocomplete_max_visible.unwrap_or(5)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_autocomplete_max_visible(&mut self, max_visible: u64) -> Result<()> {
+        self.global_mut().autocomplete_max_visible = Some(max_visible.clamp(3, 20));
+        self.save_global_scope(&["autocompleteMaxVisible"])
+    }
+
+    #[must_use]
+    pub fn get_quiet_startup(&self) -> bool {
+        self.settings().quiet_startup.unwrap_or(false)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_quiet_startup(&mut self, quiet: bool) -> Result<()> {
+        self.global_mut().quiet_startup = Some(quiet);
+        self.save_global_scope(&["quietStartup"])
+    }
+
+    /// `idleEvictionMinutes` (TS `number | "off"`; a `none` value or an
+    /// invalid number falls back to the default like the TS getter).
+    #[must_use]
+    pub fn get_idle_eviction_minutes(&self) -> String {
+        match self.settings().idle_eviction_minutes.as_ref() {
+            Some(value) if value.as_str() == Some("off") || value.as_str() == Some("none") => {
+                "off".to_string()
+            }
+            Some(value) => match value.as_f64() {
+                Some(number) if number.is_finite() && number > 0.0 => {
+                    let rounded = number.round();
+                    if (number - rounded).abs() < f64::EPSILON {
+                        format!("{rounded:.0}")
+                    } else {
+                        format!("{number}")
+                    }
+                }
+                _ => super::manager::DEFAULT_IDLE_EVICTION_MINUTES.to_string(),
+            },
+            None => super::manager::DEFAULT_IDLE_EVICTION_MINUTES.to_string(),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the value is neither `"off"` nor a positive
+    /// finite number, or when the global settings scope cannot be saved.
+    pub fn set_idle_eviction_minutes(&mut self, value: &str) -> Result<()> {
+        if value == "off" {
+            self.global_mut().idle_eviction_minutes = Some(serde_json::json!("off"));
+            return self.save_global_scope(&["idleEvictionMinutes"]);
+        }
+        let number: f64 = value
+            .parse()
+            .map_err(|_| anyhow!("Idle eviction minutes must be a positive number or off"))?;
+        if !number.is_finite() || number <= 0.0 {
+            return Err(anyhow!(
+                "Idle eviction minutes must be a positive number or off"
+            ));
+        }
+        self.global_mut().idle_eviction_minutes = Some(serde_json::json!(number));
+        self.save_global_scope(&["idleEvictionMinutes"])
+    }
+
+    /// `markdown.mermaid` (TS default `streaming`; only `off` and `final` are recognized).
+    #[must_use]
+    pub fn get_mermaid_rendering_mode(&self) -> &'static str {
+        match self
+            .settings()
+            .markdown
+            .as_ref()
+            .and_then(|markdown| markdown.mermaid)
+        {
+            Some(super::types::MermaidRenderingMode::Off) => "off",
+            Some(super::types::MermaidRenderingMode::Final) => "final",
+            _ => "streaming",
+        }
+    }
+
+    /// `markdown.mermaid` setter (`off`, `final`, or `streaming`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown rendering mode, or when the global
+    /// settings scope cannot be saved.
+    pub fn set_mermaid_rendering_mode(&mut self, mode: &str) -> Result<()> {
+        let parsed = match mode {
+            "off" => super::types::MermaidRenderingMode::Off,
+            "final" => super::types::MermaidRenderingMode::Final,
+            "streaming" => super::types::MermaidRenderingMode::Streaming,
+            other => return Err(anyhow!("Unknown mermaid rendering mode: {other}")),
+        };
+        self.global_mut()
+            .markdown
+            .get_or_insert_with(Default::default)
+            .mermaid = Some(parsed);
+        self.save_global_scope(&["markdown.mermaid"])
+    }
+
+    #[must_use]
+    pub fn get_warnings_anthropic_extra_usage(&self) -> bool {
+        self.settings()
+            .warnings
+            .as_ref()
+            .and_then(|warnings| warnings.anthropic_extra_usage)
+            .unwrap_or(true)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_warnings_anthropic_extra_usage(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut()
+            .warnings
+            .get_or_insert_with(Default::default)
+            .anthropic_extra_usage = Some(enabled);
+        self.save_global_scope(&["warnings.anthropicExtraUsage"])
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_tree_filter_mode(&mut self, mode: &str) -> Result<()> {
+        self.global_mut().tree_filter_mode = Some(mode.to_string());
+        self.save_global_scope(&["treeFilterMode"])
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_chat_detail(&mut self, detail: &str) -> Result<()> {
+        self.global_mut().chat_detail = Some(detail.to_string());
+        self.save_global_scope(&["chatDetail"])
+    }
+
+    /// `factory.enabled` (the agent factory's opt-in gate): unset reads
+    /// as disabled — the factory stays off until the user runs
+    /// `/factory on`. The read is GLOBAL SCOPE ONLY, exactly the agent-dir
+    /// document `set_factory_enabled` writes and the kernel's factory gate
+    /// reads, so no project-scope override can flip the gate out from
+    /// under the kernel (a project `.prime/agent/settings.json` with
+    /// `factory.enabled` never diverges the daemon's lane advertisement
+    /// or the client's `/factory status` from what the kernel will do).
+    #[must_use]
+    pub fn get_factory_enabled(&self) -> bool {
+        self.global_settings()
+            .factory
+            .as_ref()
+            .and_then(|factory| factory.enabled)
+            .unwrap_or(false)
+    }
+
+    /// `factory.enabled` setter: persists the opt-in gate to the global
+    /// scope (the same shared settings key the daemon's lane advertisement
+    /// and the kernel's factory gate read).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_factory_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.global_mut()
+            .factory
+            .get_or_insert_with(Default::default)
+            .enabled = Some(enabled);
+        self.save_global_scope(&["factory.enabled"])
+    }
+
+    /// `enabledModels` (TS `getEnabledModels`/`setEnabledModels`): the
+    /// persisted model-scope patterns (`None` is no filter).
+    #[must_use]
+    pub fn get_enabled_models(&self) -> Option<Vec<String>> {
+        self.settings().enabled_models.clone()
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the global settings scope cannot be saved.
+    pub fn set_enabled_models(&mut self, models: Option<Vec<String>>) -> Result<()> {
+        self.global_mut().enabled_models = models;
+        self.save_global_scope(&["enabledModels"])
+    }
+}

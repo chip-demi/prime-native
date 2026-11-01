@@ -1,0 +1,153 @@
+//! The agents-view subagent forest: how unified records nest into the session list's rows. One
+//! pass computes the record hierarchy (parent linkage, rollups), then row building emits
+//! top-level agents with their subagent summary line (the operator's 2026-09-28 one-line merge)
+//! and, when expanded, its nested children. Pure functions on the wire forms.
+
+use serde_json::Value;
+
+use crate::agents_view_state::Section;
+
+mod lineage;
+mod rows;
+mod selection;
+mod summary;
+
+pub use lineage::{compute_rollups, has_session_children, scope_ancestors, scope_to_subtree};
+pub(crate) use lineage::{scope_root, subtree_contains, ScopeRoot};
+pub(crate) use rows::build_rows;
+pub use selection::{ancestor_session_ids, resolve_selection};
+pub(crate) use summary::session_model;
+pub use summary::{selection_key, session_title, summary_identity};
+
+/// The scope of a scoped agents view (TS `AgentsViewScopeKey` plus the display name): the
+/// subtree root the view lists descendants of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentsViewScope {
+    pub session_id: Option<String>,
+    pub active_session_id: Option<String>,
+    pub session_name: Option<String>,
+}
+
+/// One rendered list row (TS `AgentsViewRow`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentsViewRow {
+    pub kind: RowKind,
+    pub section: Section,
+    pub identity: String,
+    /// The agent row this row is nested under (summary rows and nested children carry their
+    /// parent's identity).
+    pub parent_identity: Option<String>,
+    /// The merged summary the open action acts on (summary rows reuse
+    /// their parent's).
+    pub summary: Value,
+    pub title: String,
+    pub model: String,
+    pub cost: f64,
+    pub age: String,
+    /// Nesting depth: 0 for top-level agent rows.
+    pub depth: usize,
+    pub descendant_count: usize,
+    pub running_subagent_count: usize,
+    pub expanded: bool,
+    /// The row's children carry a spawn program: true only on the summary row whose children
+    /// carry code, computed where the children are known.
+    pub has_spawn_code: bool,
+}
+
+/// The list row shapes (TS `AgentsViewRowKind`, plus the activity lines and persistent shells).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A top-level agent row.
+    Agent,
+    /// The subagents summary line under an agent (the operator's 2026-09-28 one-line merge).
+    SubagentSummary,
+    /// A nested child row inside an expanded list.
+    Subagent,
+    /// A read-only spawn-program line.
+    Code,
+    /// The node's own shells line: its kernel's running shells, or without a live kernel its live
+    /// persistent shells from the daemon's list.
+    Shells,
+    /// The node's own live factory runs line.
+    FactoryRuns,
+    /// One machine-wide persistent shell with its assigned session.
+    PersistentShell,
+}
+
+/// The summary line's identity prefix (the `subagents:` prefix, so a carried selection
+/// restores onto it).
+pub(crate) const SUMMARY_ROW_PREFIX: &str = "subagents:";
+/// The shells activity line's identity prefix.
+pub(crate) const SHELLS_ROW_PREFIX: &str = "shells:";
+/// The factory-runs activity line's identity prefix.
+pub(crate) const FACTORY_ROW_PREFIX: &str = "factory:";
+
+/// The row kind a synthetic nested-row identity pins selection fallbacks to: these rows all
+/// reuse their parent's session key, so a session-id fallback must stay on the same kind of
+/// line instead of resolving to the parent agent row.
+pub(crate) fn pinned_row_kind(identity: &str) -> Option<RowKind> {
+    if identity.starts_with(SUMMARY_ROW_PREFIX) {
+        Some(RowKind::SubagentSummary)
+    } else if identity.starts_with(SHELLS_ROW_PREFIX) {
+        Some(RowKind::Shells)
+    } else if identity.starts_with(FACTORY_ROW_PREFIX) {
+        Some(RowKind::FactoryRuns)
+    } else {
+        None
+    }
+}
+
+impl AgentsViewRow {
+    /// Rows the selection may land on (TS `selectable`): the program's
+    /// code rows are read-only context, every session row selects.
+    #[must_use]
+    pub fn selectable(&self) -> bool {
+        match self.kind {
+            RowKind::Code => false,
+            RowKind::Agent
+            | RowKind::SubagentSummary
+            | RowKind::Subagent
+            | RowKind::Shells
+            | RowKind::FactoryRuns
+            | RowKind::PersistentShell => true,
+        }
+    }
+}
+
+/// One session's stable selection key (TS `AgentsViewSelectionKey`): a row's identity flips
+/// when its session persists or re-attaches, so the session ids re-find it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SelectionKey {
+    pub session_id: Option<String>,
+    pub active_session_id: Option<String>,
+}
+
+/// One session's own activity counts (a live one's keyed by its `activeSessionId`): the shells and
+/// factory-run lines render them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionActivity {
+    pub shells: crate::bash_view::ShellCounts,
+    pub factory_runs: crate::factory_view::FactoryRunCounts,
+}
+
+/// The activity poll's counts: each live session's by its `activeSessionId`, and the live
+/// persistent shells by their assigned `sessionId` (every session's persistent count).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityCounts {
+    pub live: std::collections::HashMap<String, SessionActivity>,
+    pub persistent_shells: std::collections::HashMap<String, crate::bash_view::ShellCounts>,
+}
+
+/// One recursive rollup over the record hierarchy (TS
+/// `AgentsViewRecursiveRollup`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Rollup {
+    pub cost: f64,
+    /// Every descendant subagent's spend: each child's recursive rollup plus this record's
+    /// deleted-descendant bucket. Status-independent — all descendants bill.
+    pub descendants: f64,
+    pub descendant_count: usize,
+}
+
+#[cfg(test)]
+mod tests;

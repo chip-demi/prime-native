@@ -1,0 +1,683 @@
+//! The worker's compaction runs: the `compact`/`abort_compaction`
+//! handlers, the `compaction_start`/`compaction_end` event frames with
+//! their exact TS shapes, the `isCompacting` state flag, and the durable
+//! compaction entry the worker appends to the session store.
+
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Map, Value};
+
+use crate::engine::{CompactionOutcome, CompactionRequest, SessionEngine};
+use crate::protocol::DaemonOutbound;
+use crate::worker::{EventPump, OutboundFrame, SessionCore};
+use pa_agent::abort::AbortController;
+use pa_core::session_engine::messages::{CompactionOutcomeKind, CompactionOutcomeReason};
+
+/// The worker's compaction machinery: the live-run abort slot plus the
+/// compaction flow. One slot per session, replaced by each new run.
+pub(crate) struct CompactionManager {
+    engine: Arc<dyn SessionEngine>,
+    events: Arc<EventPump>,
+    core: Arc<Mutex<SessionCore>>,
+    active_session_id: String,
+    agent_dir: std::path::PathBuf,
+    abort: Mutex<Option<Arc<AbortController>>>,
+}
+
+impl CompactionManager {
+    pub(crate) fn new(
+        engine: Arc<dyn SessionEngine>,
+        events: Arc<EventPump>,
+        core: Arc<Mutex<SessionCore>>,
+        active_session_id: String,
+        agent_dir: std::path::PathBuf,
+    ) -> Self {
+        CompactionManager {
+            engine,
+            events,
+            core,
+            active_session_id,
+            agent_dir,
+            abort: Mutex::new(None),
+        }
+    }
+
+    /// `abort_compaction`: abort the manual run's controller and the automatic run.
+    /// Succeeds whether or not a run is in flight (the TS handler always replies success).
+    pub(crate) fn abort(&self) {
+        let controller = self.abort.lock().unwrap().clone();
+        if let Some(controller) = controller {
+            controller.abort();
+        }
+        self.engine.abort_auto_compaction();
+    }
+
+    /// Run one compaction (`compact` command): emits the TS event pair,
+    /// keeps `isCompacting` set for the run, appends the durable entry.
+    pub(crate) async fn run(
+        &self,
+        custom_instructions: Option<String>,
+        idle_notify: &tokio::sync::Notify,
+    ) -> CompactionOutcome {
+        // A compaction interrupts the running turn first (TS `compact()` aborts the agent).
+        self.wait_for_turn_end(idle_notify).await;
+
+        let controller = Arc::new(AbortController::new());
+        let signal = controller.signal();
+        {
+            // Each run replaces the live slot; aborts hit the newest run, and only its own
+            // run clears the slot.
+            *self.abort.lock().unwrap() = Some(Arc::clone(&controller));
+        }
+        {
+            let mut core = self.core.lock().unwrap();
+            core.compacting = true;
+        }
+        let start = compaction_start_event("manual", custom_instructions.as_deref());
+        let _ = self.emit_session_event(start);
+        pa_core::session_engine::compaction_trace::trace(
+            "manual.start_emitted",
+            &serde_json::Value::Null,
+        );
+
+        let engine = Arc::clone(&self.engine);
+        let request = CompactionRequest {
+            custom_instructions: custom_instructions.clone(),
+        };
+        let run_signal = signal.clone();
+        let outcome = {
+            let engine = Arc::clone(&engine);
+            tokio::task::spawn_blocking(move || engine.run_compaction(request, &run_signal))
+                .await
+                .unwrap_or_else(|join_error| CompactionOutcome::Failed {
+                    error: format!("compaction run failed: {join_error}"),
+                })
+        };
+
+        if let CompactionOutcome::Compacted { run } = &outcome {
+            pa_core::session_engine::compaction_trace::trace(
+                "manual.compact_returned",
+                &serde_json::Value::Null,
+            );
+            let persist_started = std::time::Instant::now();
+            self.persist_compaction(run, custom_instructions.as_deref());
+            pa_core::session_engine::compaction_trace::trace(
+                "manual.compaction_persisted",
+                &serde_json::json!({
+                    "micros": persist_started.elapsed().as_micros(),
+                }),
+            );
+            // The post-compaction kernel notice's `message_start`/`message_end` pair precedes
+            // `compaction_end` on the wire (TS `_performCompaction` order).
+            if let Some(message) = &run.ipython_state {
+                self.persist_and_emit_ipython_state(message);
+            }
+        }
+        let end = compaction_end_event(&outcome, custom_instructions.as_deref());
+        let _ = self.emit_session_event(end);
+        pa_core::session_engine::compaction_trace::trace(
+            "manual.end_emitted",
+            &serde_json::Value::Null,
+        );
+        // `isCompacting` spans the durable entry and the `compaction_end` emit
+        // (the TS `finally` clear): clearing earlier would admit a racing
+        // turn, interleaving the file (a user row before its compaction entry).
+        {
+            let mut core = self.core.lock().unwrap();
+            core.compacting = false;
+        }
+        // Every settle-waiting flag clear must wake the waits parked on it: the waits
+        // register their `idle_notify` permit BEFORE checking the flags, or a clear parks them.
+        idle_notify.notify_waiters();
+        {
+            let mut slot = self.abort.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|live| Arc::ptr_eq(live, &controller))
+            {
+                *slot = None;
+            }
+        }
+        outcome
+    }
+
+    /// `set_auto_compaction`: update the connection-state flag (the
+    /// persistent write lives in the `set_auto_compaction` handler).
+    pub(crate) fn set_auto_compaction(&self, enabled: bool) {
+        let mut core = self.core.lock().unwrap();
+        core.auto_compaction_enabled = enabled;
+    }
+
+    /// Wait until the running turn (if any) has settled.
+    async fn wait_for_turn_end(&self, idle_notify: &tokio::sync::Notify) {
+        loop {
+            let busy = {
+                let mut core = self.core.lock().unwrap();
+                if core.busy {
+                    core.abort_requested = true;
+                    core.turn_cancelled = true;
+                    // TS `compact()` detaches from agent events before the abort, so the
+                    // interrupted turn's aborted row never reaches the wire or the session file.
+                    core.suppress_aborted_row = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !busy {
+                break;
+            }
+            // The parked flag gates the turn's events; the engine abort cancels the in-flight
+            // fetch immediately, so the interrupt never waits out a pending response.
+            self.engine.abort_in_flight_turn();
+            // The turn runner notifies when the queue drains; the timeout backstops a missed
+            // notification.
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(50), idle_notify.notified())
+                    .await;
+        }
+        // The interrupted turn settled (its row swallowed exactly like the
+        // TS compact path); the suppression owns only that drain window.
+        self.core.lock().unwrap().suppress_aborted_row = false;
+    }
+
+    /// Append the durable compaction entry (TS `appendCompaction`). A real
+    /// engine hands over its full durable record; a scripted engine (a test
+    /// seam) builds it from the wire result.
+    fn persist_compaction(
+        &self,
+        run: &crate::engine::CompactionRun,
+        custom_instructions: Option<&str>,
+    ) {
+        let result = &run.result;
+        let mut core = self.core.lock().unwrap();
+        let cwd = core.cwd.clone();
+        let Some(store) = core.store.as_mut() else {
+            return;
+        };
+        let mut fields = if run.entry.is_object() {
+            run.entry.clone()
+        } else {
+            let mut fields = json!({
+                "summary": result.get("summary").cloned().unwrap_or_default(),
+                // The TS `CompactionEntry` field order (the JSON map preserves
+                // insertion order; the value is re-pinned in place below).
+                "firstKeptEntryId": "",
+                "tokensBefore": result.get("tokensBefore").cloned().unwrap_or(json!(0)),
+                "details": result.get("details").cloned().unwrap_or_else(|| json!({
+                    "readFiles": [], "modifiedFiles": [],
+                })),
+                "fromHook": false,
+            });
+            if let Some(custom_instructions) = custom_instructions {
+                fields["customInstructions"] = json!(custom_instructions);
+            }
+            if let Some(usage) = &run.usage {
+                fields["usage"] = usage.clone();
+            }
+            fields
+        };
+        // The engine's id references its in-memory entry list: re-pin the boundary to the
+        // durable cut.
+        let first_kept_entry_id = fields
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let first_kept_entry_id = if first_kept_entry_id.is_empty() {
+            store
+                .branch()
+                .iter()
+                .find(|entry| entry.type_ == "message")
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default()
+        } else {
+            let keep_recent = pa_core::settings::SettingsManager::create(&cwd, &self.agent_dir)
+                .settings()
+                .compaction
+                .clone()
+                .unwrap_or_default()
+                .keep_recent_tokens
+                .unwrap_or(pa_core::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS);
+            store
+                .durable_first_kept_entry_id(keep_recent)
+                .unwrap_or(first_kept_entry_id)
+        };
+        fields["firstKeptEntryId"] = json!(first_kept_entry_id);
+        let _ = store.persist_entry("compaction", fields);
+    }
+
+    /// Persist the post-compaction `ipython_state` row and broadcast its `message_start`/
+    /// `message_end` pair (TS `appendCustomMessageEntry`).
+    fn persist_and_emit_ipython_state(&self, message: &Value) {
+        let mut core = self.core.lock().unwrap();
+        crate::worker::persist_custom_row(&mut core, message);
+        crate::worker::broadcast_custom_row_locked(&mut core, &self.events, message);
+    }
+
+    /// Sequence and broadcast one compaction `session_event` frame.
+    fn emit_session_event(&self, event: Value) -> serde_json::Result<()> {
+        let mut core = self.core.lock().unwrap();
+        let sequence = core.last_event_sequence + 1;
+        core.last_event_sequence = sequence;
+        let meta = crate::protocol::create_daemon_event_meta(
+            &self.active_session_id,
+            sequence,
+            None,
+            Some(&core.generation),
+        );
+        let outbound = DaemonOutbound::SessionEvent {
+            active_session_id: self.active_session_id.clone(),
+            event,
+            meta: Some(meta),
+            rest: Map::default(),
+        };
+        let payload = serde_json::to_vec(&outbound)?;
+        self.events.send(OutboundFrame::session_event(payload));
+        drop(core);
+        Ok(())
+    }
+}
+
+/// The `compaction_start` event payload (TS `AgentSessionEvent`). Shared by
+/// every compaction surface, each with its own `reason`.
+pub(crate) fn compaction_start_event(reason: &str, custom_instructions: Option<&str>) -> Value {
+    let mut event = json!({ "type": "compaction_start", "reason": reason });
+    if let Some(custom_instructions) = custom_instructions {
+        event["customInstructions"] = json!(custom_instructions);
+    }
+    event
+}
+
+/// The `compaction_summary_delta` event payload: one frame per summarizer text delta. The
+/// frames are ephemeral — never persisted, never replayed.
+pub(crate) fn compaction_summary_delta_event(delta: &str) -> Value {
+    json!({ "type": "compaction_summary_delta", "delta": delta })
+}
+
+/// The client-facing `CompactionResult` of a successful compaction (TS `_performCompaction`'s
+/// return): summary, firstKeptEntryId, tokensBefore, and the entry's file-op `details` verbatim.
+/// `usage` never rides the wire result.
+pub(crate) fn compaction_result_value(
+    result: &pa_core::session_engine::compaction_exec::CompactionResult,
+    entry: &pa_types::session::CompactionEntry,
+) -> Value {
+    let mut value = json!({
+        "summary": result.summary,
+        "firstKeptEntryId": result.first_kept_entry_id,
+        "tokensBefore": result.tokens_before,
+    });
+    if let Some(details) = &entry.details {
+        value["details"] = details.clone();
+    }
+    value
+}
+
+/// The `compaction_end` payload of a successful compaction (TS `AgentSessionEvent`): the
+/// client-facing `CompactionResult` plus the failed-turn retry flag.
+pub(crate) fn compaction_end_success(
+    reason: &str,
+    result: &Value,
+    will_retry: bool,
+    custom_instructions: Option<&str>,
+) -> Value {
+    let mut event = json!({
+        "type": "compaction_end",
+        "reason": reason,
+        "result": result,
+        "aborted": false,
+        "willRetry": will_retry,
+    });
+    if let Some(custom_instructions) = custom_instructions {
+        event["customInstructions"] = json!(custom_instructions);
+    }
+    event
+}
+
+/// The `compaction_end` payload of an unsuccessful compaction: `aborted` marks a cancelled
+/// run; a skip or failure carries `errorMessage` with the matching `errorSeverity`.
+pub(crate) fn compaction_end_unsuccessful(
+    reason: &str,
+    aborted: bool,
+    error_message: Option<&str>,
+    error_severity: Option<&str>,
+    custom_instructions: Option<&str>,
+) -> Value {
+    let mut event = json!({
+        "type": "compaction_end",
+        "reason": reason,
+        "aborted": aborted,
+        "willRetry": false,
+    });
+    if let Some(error_message) = error_message {
+        event["errorMessage"] = json!(error_message);
+    }
+    if let Some(error_severity) = error_severity {
+        event["errorSeverity"] = json!(error_severity);
+    }
+    if let Some(custom_instructions) = custom_instructions {
+        event["customInstructions"] = json!(custom_instructions);
+    }
+    event
+}
+
+/// The durable disclosure of a compaction the supervisor declared aborted: the same
+/// `compaction_outcome` row the worker's own auto-abort arms persist, plus the declaration's
+/// timestamp — so the create handler recognizes its own row. A manual run has no row.
+pub(crate) struct InterruptedCompactionDisclosure {
+    pub(crate) row: Value,
+    pub(crate) declared_at: String,
+}
+
+/// Rebuild the [`InterruptedCompactionDisclosure`] from the create payload's
+/// `interruptedCompaction` record, or `None` for a run that persists no row.
+pub(crate) fn interrupted_compaction_disclosure(
+    payload: &Value,
+) -> Option<InterruptedCompactionDisclosure> {
+    let record = payload.get("interruptedCompaction")?;
+    let reason = match record.get("reason").and_then(Value::as_str) {
+        Some("threshold") => CompactionOutcomeReason::Threshold,
+        Some("overflow") => CompactionOutcomeReason::Overflow,
+        Some("requested") => CompactionOutcomeReason::Requested,
+        _ => return None,
+    };
+    let declared_at = record
+        .get("declaredAt")
+        .and_then(Value::as_str)
+        .map_or_else(crate::util::now_iso, str::to_string);
+    let message = crate::session_commands::custom_message_value(
+        &pa_core::session_engine::messages::create_compaction_outcome_message(
+            "Compaction cancelled",
+            reason,
+            CompactionOutcomeKind::Cancelled,
+        ),
+    );
+    let row = json!({
+        "customType": message.get("customType").cloned().unwrap_or(Value::Null),
+        "content": message.get("content").cloned().unwrap_or(Value::Null),
+        "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
+        "details": message.get("details").cloned().unwrap_or(Value::Null),
+    });
+    Some(InterruptedCompactionDisclosure { row, declared_at })
+}
+
+/// The `compaction_end` event payload (TS `AgentSessionEvent`), per outcome:
+/// success carries `result`; the rest carry `errorMessage`/`errorSeverity`.
+fn compaction_end_event(outcome: &CompactionOutcome, custom_instructions: Option<&str>) -> Value {
+    match outcome {
+        CompactionOutcome::Compacted { run } => {
+            compaction_end_success("manual", &run.result, false, custom_instructions)
+        }
+        CompactionOutcome::Skipped { message } => compaction_end_unsuccessful(
+            "manual",
+            false,
+            Some(message),
+            Some("warning"),
+            custom_instructions,
+        ),
+        CompactionOutcome::Failed { error } => compaction_end_unsuccessful(
+            "manual",
+            false,
+            Some(&format!("Compaction failed: {error}")),
+            Some("error"),
+            custom_instructions,
+        ),
+        CompactionOutcome::Aborted => {
+            compaction_end_unsuccessful("manual", true, None, Some("error"), custom_instructions)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn custom_rows_on_each_side_of_collapse_appear_once_in_wire_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","id":"collapse-order","version":3,"timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let worker = crate::worker::Worker::new(
+            crate::worker::WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: std::path::PathBuf::new(),
+                token: "token".to_string(),
+                worker_instance_id: String::new(),
+                active_session_id: "collapse-order".to_string(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                script: Some(json!({ "responses": ["ack"] })),
+                telemetry_disabled: Some(true),
+            },
+            None,
+        );
+        worker.core.lock().unwrap().store =
+            Some(crate::session_store::SessionFile::open(&path).unwrap());
+        let mut subscription = worker.events.subscribe();
+        let row = |content| {
+            json!({
+                "role": "custom", "customType": "notice", "content": content,
+                "display": true, "details": null,
+            })
+        };
+        let before = row("before collapse");
+        let after = row("after collapse");
+        worker.emit_custom_row(&before);
+        let result = json!({ "summary": "collapsed history", "tokensBefore": 1234 });
+        worker
+            .compaction
+            .emit_session_event(compaction_end_success("manual", &result, false, None))
+            .unwrap();
+        worker.emit_custom_row(&after);
+        let frames: Vec<Value> = (0..5)
+            .map(|_| serde_json::from_slice(&subscription.try_recv().unwrap().payload).unwrap())
+            .collect();
+        let expected_events = [
+            json!({ "type": "message_start", "message": before }),
+            json!({ "type": "message_end", "message": before }),
+            json!({
+                "type": "compaction_end", "reason": "manual",
+                "result": { "summary": "collapsed history", "tokensBefore": 1234 },
+                "aborted": false, "willRetry": false,
+            }),
+            json!({ "type": "message_start", "message": after }),
+            json!({ "type": "message_end", "message": after }),
+        ];
+        let actual: Vec<Value> = frames.iter().map(|frame| frame["event"].clone()).collect();
+        assert_eq!(actual, expected_events);
+        let sequences: Vec<Value> = frames
+            .iter()
+            .map(|frame| frame["meta"]["sequence"].clone())
+            .collect();
+        assert_eq!(
+            sequences,
+            vec![json!(1), json!(2), json!(3), json!(4), json!(5)]
+        );
+    }
+
+    #[test]
+    fn compaction_result_value_mirrors_the_ts_datakeys() {
+        let result = pa_core::session_engine::compaction_exec::CompactionResult {
+            summary: "the story so far".to_string(),
+            first_kept_entry_id: "abcd1234".to_string(),
+            tokens_before: 1234,
+            usage: Some(pa_types::ai::Usage::default()),
+        };
+        let entry = pa_types::session::CompactionEntry {
+            summary: result.summary.clone(),
+            first_kept_entry_id: result.first_kept_entry_id.clone(),
+            tokens_before: result.tokens_before,
+            details: Some(json!({ "readFiles": ["a.rs"], "modifiedFiles": ["b.rs"] })),
+            from_hook: Some(false),
+            custom_instructions: None,
+            usage: result.usage,
+            harness_digest: None,
+            harness_state_fingerprint: None,
+        };
+        // The TS `compact` response dataKeys (the live golden,
+        // `tests/goldens/compaction-live-ts.json`): summary,
+        // firstKeptEntryId, tokensBefore, details — with the entry's
+        // `details` verbatim and the summarizer usage never on the wire.
+        assert_eq!(
+            compaction_result_value(&result, &entry),
+            json!({
+                "summary": "the story so far",
+                "firstKeptEntryId": "abcd1234",
+                "tokensBefore": 1234,
+                "details": { "readFiles": ["a.rs"], "modifiedFiles": ["b.rs"] },
+            })
+        );
+        // Byte order: the JSON map preserves the TS dataKeys' insertion
+        // order (readFiles first inside `details`).
+        assert_eq!(
+            serde_json::to_string(&compaction_result_value(&result, &entry)).unwrap(),
+            "{\"summary\":\"the story so far\",\"firstKeptEntryId\":\"abcd1234\",\"tokensBefore\":1234,\"details\":{\"readFiles\":[\"a.rs\"],\"modifiedFiles\":[\"b.rs\"]}}"
+        );
+        // A run whose entry carries no details drops the key, like TS's
+        // `undefined` under JSON serialization.
+        let bare = pa_types::session::CompactionEntry {
+            details: None,
+            ..entry
+        };
+        assert_eq!(
+            compaction_result_value(&result, &bare),
+            json!({
+                "summary": "the story so far",
+                "firstKeptEntryId": "abcd1234",
+                "tokensBefore": 1234,
+            })
+        );
+    }
+
+    #[test]
+    fn event_shapes_match_ts() {
+        let run = crate::engine::CompactionRun {
+            result: json!({
+                "summary": "the story so far",
+                "firstKeptEntryId": "abcd1234",
+                "tokensBefore": 1234,
+                "details": { "readFiles": ["a.rs"], "modifiedFiles": [] },
+            }),
+            usage: None,
+            entry: Value::Null,
+            ipython_state: None,
+        };
+        assert_eq!(
+            compaction_start_event("manual", Some("focus on the goal")),
+            json!({
+                "type": "compaction_start",
+                "reason": "manual",
+                "customInstructions": "focus on the goal",
+            })
+        );
+        assert_eq!(
+            compaction_start_event("manual", None),
+            json!({ "type": "compaction_start", "reason": "manual" })
+        );
+        assert_eq!(
+            compaction_summary_delta_event("one chunk of the summary"),
+            json!({ "type": "compaction_summary_delta", "delta": "one chunk of the summary" })
+        );
+        assert_eq!(
+            compaction_end_event(
+                &CompactionOutcome::Compacted { run: Box::new(run) },
+                Some("focus")
+            ),
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "result": {
+                    "summary": "the story so far",
+                    "firstKeptEntryId": "abcd1234",
+                    "tokensBefore": 1234,
+                    "details": { "readFiles": ["a.rs"], "modifiedFiles": [] },
+                },
+                "aborted": false,
+                "willRetry": false,
+                "customInstructions": "focus",
+            })
+        );
+        assert_eq!(
+            compaction_end_event(
+                &CompactionOutcome::Skipped {
+                    message: "Session is too short to compact — try again once it grows"
+                        .to_string(),
+                },
+                None,
+            ),
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "aborted": false,
+                "willRetry": false,
+                "errorMessage": "Session is too short to compact — try again once it grows",
+                "errorSeverity": "warning",
+            })
+        );
+        assert_eq!(
+            compaction_end_event(&CompactionOutcome::Aborted, None),
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "aborted": true,
+                "willRetry": false,
+                "errorSeverity": "error",
+            })
+        );
+        assert_eq!(
+            compaction_end_event(
+                &CompactionOutcome::Failed {
+                    error: "Summarization failed".to_string(),
+                },
+                None,
+            ),
+            json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "aborted": false,
+                "willRetry": false,
+                "errorMessage": "Compaction failed: Summarization failed",
+                "errorSeverity": "error",
+            })
+        );
+    }
+
+    #[test]
+    fn interrupted_disclosure_is_the_auto_abort_row_stamped_with_the_declaration() {
+        let disclosure = interrupted_compaction_disclosure(&json!({
+            "interruptedCompaction": {
+                "reason": "threshold",
+                "sessionFile": "/sessions/a.jsonl",
+                "declaredAt": "2026-09-23T06:00:00Z",
+            }
+        }))
+        .expect("a threshold run discloses");
+        assert_eq!(
+            disclosure.row,
+            json!({
+                "customType": "compaction_outcome",
+                "content": "Compaction cancelled",
+                "display": true,
+                "details": { "reason": "threshold", "outcome": "cancelled" },
+            })
+        );
+        assert_eq!(disclosure.declared_at, "2026-09-23T06:00:00Z");
+
+        for reason in ["manual", "unknown"] {
+            assert!(
+                interrupted_compaction_disclosure(&json!({
+                    "interruptedCompaction": { "reason": reason, "declaredAt": "2026-09-23T06:00:00Z" }
+                }))
+                .is_none(),
+                "{reason} persists no row"
+            );
+        }
+    }
+}

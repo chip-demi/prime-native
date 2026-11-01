@@ -1,0 +1,1450 @@
+//! Client commands: envelope, frame types, and the full `DaemonCommand` union.
+//! Wire shapes match the TS daemon protocol exactly.
+
+#[cfg(test)]
+use super::rt;
+use super::{
+    AgentMessage, DaemonClientCapability, DaemonClientId, DaemonCommandId, DaemonProtocolInfo,
+    DaemonResumeCursor, Deserialize, JsonMap, Serialize, Value,
+};
+
+/// One page of the display transcript (the branch in order, each compaction as its
+/// summary row), bounded by entry-id cursors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "camelCase")]
+pub enum TranscriptPage {
+    /// The newest `limit` rows before the `before` row; the tail without it.
+    End {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        limit: usize,
+    },
+    /// The oldest `limit` rows after the `after` row (the head without it),
+    /// stopping before the `until` row.
+    Start {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<String>,
+        limit: usize,
+    },
+}
+
+impl TranscriptPage {
+    /// Whether the page can reach rows older than a windowed store's loaded suffix.
+    #[must_use]
+    pub fn reads_history(&self) -> bool {
+        !matches!(self, Self::End { before: None, .. })
+    }
+}
+
+/// `type: "command"` envelope wrapping a [`DaemonCommand`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonCommandEnvelope {
+    #[serde(rename = "type")]
+    pub frame_type: DaemonCommandFrameType,
+    pub id: DaemonCommandId,
+    pub protocol: DaemonProtocolInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<DaemonClientId>,
+    pub command: DaemonCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaemonCommandFrameType {
+    #[serde(rename = "command")]
+    Command,
+}
+
+/// A bare command or a command envelope, both accepted on one socket line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DaemonCommandWire {
+    Command(DaemonCommand),
+    Envelope(DaemonCommandEnvelope),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StreamingBehavior {
+    Steer,
+    FollowUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonSessionLifecycle {
+    Resident,
+    ClientOwned,
+}
+
+/// `prompt`/`steer`/`follow_up`-family input payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_behavior: Option<StreamingBehavior>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_if_busy: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expand_prompt_templates: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_message: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_messages: Option<Value>,
+    /// Unique only when the caller needs cancellable pre-ownership admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_id: Option<String>,
+    /// One-shot capability only the daemon's own RLM children delivery mints; never a client field:
+    /// a caller-supplied value can never name a live mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rlm_notice_nonce: Option<String>,
+}
+
+/// Client commands, tagged by `type`. Every variant carries `id` (bare
+/// commands) and a catch-all for unknown fields, so round-trips stay lossless.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DaemonCommand {
+    List {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        all: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include_client_owned: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// `list_saved_sessions` (session- and cwd-addressed forms share this shape).
+    ListSavedSessions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_dir: Option<String>,
+        #[serde(default)]
+        scope: Value,
+        /// The most session files this request folds; `None` walks to the end of the store.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+        /// A previous response's `nextCursor`: the walk resumes after that file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ListAgentPeers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// The requester's worker token; optional on the wire (an absent
+        /// token is an auth failure, not a parse one).
+        #[serde(default)]
+        worker_token: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetDirectWorkerTransport {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Worker-to-worker peer ticket: mint a single-use `worker`-purpose grant for a target worker's
+    /// direct socket, bypassing the supervisor's route plane; authenticated by the requester's
+    /// worker token, like `list_agent_peers`.
+    GetWorkerPeerTransport {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        worker_token: String,
+        target_active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    RosterSubscribe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Worker -> supervisor idle-passivation request: a parent-owned child whose idle clock crossed
+    /// `idleEvictionMinutes` asks for the graceful stop; the supervisor verifies the worker token
+    /// and the parent-owned descriptor. Clients never send this.
+    WorkerIdlePassivation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        worker_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_minutes: Option<u64>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Worker -> supervisor roster delta (TS `roster_delta`): the worker pushes its slim session
+    /// summary so the roster tracks live status without polling.
+    WorkerRosterDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        worker_token: String,
+        summary: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removed: Option<Vec<String>>,
+        /// Monotonic per-worker sequence; the supervisor drops a delta older
+        /// than one already applied. Absent means unsequenced (always applied).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        /// The sending worker process instance: a replacement reuses the
+        /// worker id but restarts its sequence, so the stale-delta gate keeps
+        /// one generation slot per worker and drops a predecessor's deltas.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_instance_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    RosterUnsubscribe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Create {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continue_recent: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        no_session: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<Value>,
+        /// Telemetry opt-out: only ever `Some(true)`; absent means enabled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry_disabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_metadata: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lifecycle: Option<DaemonSessionLifecycle>,
+        /// Allowlisted client env vars (`env`), carried on create only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_env: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Attach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<DaemonClientId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Vec<DaemonClientCapability>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_cursor: Option<DaemonResumeCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry_disabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery_config: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_env: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Reattach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        target_active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<DaemonClientId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Vec<DaemonClientCapability>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_cursor: Option<DaemonResumeCursor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry_disabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery_config: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_env: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Detach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetOwnedWorkerCleanup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        worker_id: String,
+        worker_instance_id: String,
+        owner_client_id: String,
+        supervisor_generation: String,
+        #[serde(default)]
+        wait_timeout_ms: u64,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CompleteOwnedSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    PromoteOwnedSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Kill {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Rename {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        name: String,
+        /// Who directed the rename (`renamedBy` on the wire, TS
+        /// `AgentFamilyRelationship` — only `"parent"` is sent): set when a
+        /// parent session renames one of its direct children, so the
+        /// renamed session's transcript notice can name it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renamed_by: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Prompt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        message: String,
+        #[serde(flatten)]
+        input: PromptInput,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CancelPromptAdmission {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        admission_id: String,
+        /// Cancel session-owned work too when it has not started delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel_owned: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    PromptAndWait {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        message: String,
+        #[serde(flatten)]
+        input: PromptInput,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Steer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        message: String,
+        #[serde(flatten)]
+        input: PromptInput,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    FollowUp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        message: String,
+        #[serde(flatten)]
+        input: PromptInput,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    RestoreNextTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        messages: Vec<AgentMessage>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    RestoreActions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        snapshot: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AppendCustomMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        message: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ResumeQueue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SendMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        target_active_session_id: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_active_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_origin: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_mode: Option<Value>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AgentMessagesStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AgentMessagesPause {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AgentMessagesResume {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AgentMessagesClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    DroneSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    DroneRecover {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    DroneStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Abort {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// `abort_and_send_queued` (schema 29, capability-gated in TS): abort the run and deliver the
+    /// queued steering batch at the turn boundary (TS `AgentSession.abortAndSendQueued`).
+    AbortAndSendQueued {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    StartSideQuestion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        // Optional on the wire (a routing miss answers before the payload is read).
+        #[serde(default)]
+        side_question_id: String,
+        #[serde(default)]
+        question: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_turns: Option<Value>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AbortSideQuestion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        // Optional on the wire, like `start_side_question`'s payload.
+        #[serde(default)]
+        side_question_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ExecuteBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exclude_from_context: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transient: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AbortBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Rust-native extension, advertised by the `kernel_bash_activity` capability.
+    ListKernelBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    TailKernelBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        activity_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<u32>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    KillKernelBash {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        activity_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Every persistent `bash()` shell machine-wide with its assigned session id.
+    /// Rust-native extension, advertised by the `persistent_shells` capability.
+    ListPersistentShells {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    TailPersistentShell {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        shell_id: String,
+        lines: u32,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    KillPersistentShell {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        shell_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// The `/factory` view's bridge lane over the session kernel's factory
+    /// executor (`graph`/`status`/`watch`/`run`/`stop`/`resume`).
+    /// Rust-native extension, advertised by the `factory_activity` capability.
+    FactoryActivity {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spec_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CancelRlmChild {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        child_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    DeleteRlmSubagent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        child_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    WaitForIdle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        /// Also hold until every RLM child run of the session settled
+        /// (the `wait_for_headless_completion` barrier of the same name).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_for_rlm_quiescence: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    WaitForHeadlessCompletion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_for_rlm_quiescence: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetSessionHeader {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    EditGoalObjective {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(alias = "expectedGoalId")]
+        goal_id: String,
+        expected_objective: String,
+        objective: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    #[serde(rename = "drone_control")]
+    ControlDrone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        root_session_id: String,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<u64>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ControlGoal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(alias = "expectedGoalId")]
+        goal_id: String,
+        expected_objective: String,
+        action: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetInputReceipts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        queue_key: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetConnectionState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<TranscriptPage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Vec<DaemonClientCapability>>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// One slice of the session's display transcript:
+    /// `rows[start:][:limit]` over the rows whose role matches a `roles` glob.
+    /// Rust-native extension.
+    GetSessionMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        start: i64,
+        limit: u64,
+        roles: Vec<String>,
+        /// The session's file, which the supervisor reads when no worker holds the
+        /// session (a family member's read).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_file: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetRlmChildren {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ConfigureOrchestrationGate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetOrchestrationGate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetSessionStats {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetContextTree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetCommands {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetResourceSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetMcpConnections {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// The inline paste flow: install a pasted static token for one
+    /// pasteable catalog service, verifying with a real MCP handshake.
+    SetMcpStaticToken {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        server: String,
+        token: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Remove one MCP connection: credential and connection record (the
+    /// durable endpoint pin) in one step.
+    RemoveMcpConnection {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        server: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ReplaceAcpMcpServers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        owner_id: String,
+        servers: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetModelCatalog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetAvailableModels {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetQueue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    MutateQueuedMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        lane: Value,
+        index: u64,
+        expected_text: String,
+        mutation: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ClearQueue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AbortAndClearQueue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AcquireSessionInputPause {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        lease_key: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ReleaseSessionInputPause {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        pause_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CronList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include_inactive: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    HeartbeatsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    HeartbeatManage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        job_id: String,
+        action: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CronAdd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        schedule: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        promote_owned_session: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CronCancel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        job_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    HeartbeatGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    HeartbeatSet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        schedule: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_mode: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        promote_owned_session: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    HeartbeatUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        action: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetModel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        provider: String,
+        model_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CycleModel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<CycleDirection>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetScopedModels {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        scoped_models: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetThinkingLevel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        // Optional on the wire (the TS runtime reads it after routing).
+        #[serde(default)]
+        level: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetServiceTier {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        service_tier: Option<crate::ai::ServiceTier>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    CycleThinkingLevel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetTransport {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        transport: crate::ai::Transport,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetSteeringMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        mode: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetFollowUpMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        mode: Value,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetAutoCompaction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        enabled: bool,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetAutoRetry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        enabled: bool,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Compact {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_instructions: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Refine {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rollback_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        global: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AbortCompaction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AbortBranchSummary {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AbortRetry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ExecuteBashAndWait {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        command: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Reload {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    NewSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SwitchSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        session_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_override: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Fork {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        entry_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<ForkPosition>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    NavigateTree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summarize: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_instructions: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replace_instructions: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ImportJsonl {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        input_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_override: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ExportHtml {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_path: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    ExportJsonl {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_path: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetSessionName {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_token: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetRlmMaxDepthStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetRlmMaxDepth {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        max_depth: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        global: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    RenameSavedSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        session_path: String,
+        name: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    DeleteSavedSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_session_id: Option<String>,
+        session_path: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetSessionContext {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetSessionTree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetUserMessagesForForking {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetLastAssistantText {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetSystemPrompt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    GetToolDefinition {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        name: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    SetSessionEntryLabel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        entry_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Rust-native client command (operator directive 2026-09-29): the
+    /// interactive client's report that it just drew the Anthropic
+    /// subscription ban-risk warning — the worker persists the session's
+    /// once-per-lifecycle marker row so a reattach, a resume, or a worker
+    /// replacement of the same session skips the warning (the TS gate is
+    /// per interactive-mode instance, so the TS protocol has no
+    /// counterpart; an older daemon rejects the frame and the client
+    /// degrades to its per-instance gate).
+    MarkAnthropicWarningShown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    AckResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        command_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Coordinator -> supervisor: start (or idempotently poll) the prepare transaction for
+    /// `updateId`; same id returns the current state, a different id is refused.
+    PrepareUpdateRestart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Coordinator -> supervisor: consume the prepared transaction and stop
+    /// gracefully (the only consumption of the prepared artifact).
+    CommitUpdateRestart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    RetryWorker {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Query the supervisor's boot-time restore pass (spec §6/§9): whether the restore is in flight
+    /// and the per-session counts/failures for the coordinator's `Restoring` phase. Read-only.
+    UpdateRestoreStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update_id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Restart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    Shutdown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force: Option<bool>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// Session-worker self-registration (worker -> supervisor); the same
+    /// command re-registers after a supervisor restart. The token was issued
+    /// by the supervisor, so only the real worker can present it.
+    WorkerRegister {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        socket_path: String,
+        worker_instance_id: String,
+        token: String,
+        pid: u64,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CycleDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForkPosition {
+    Before,
+    At,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versioned_goal_alias_keeps_extension_and_installed_goal_wire() {
+        for kind in ["control_goal", "edit_goal_objective"] {
+            let mut wire = serde_json::json!({"type":kind,"activeSessionId":"s","expectedGoalId":"g",
+                "expectedObjective":"old","extensionVersion":1,"action":"resume","objective":"new"});
+            let command: DaemonCommand = serde_json::from_value(wire.clone()).unwrap();
+            wire.as_object_mut().unwrap().remove("expectedGoalId");
+            wire["goalId"] = serde_json::json!("g");
+            assert_eq!(serde_json::to_value(command).unwrap(), wire);
+        }
+        rt::<DaemonCommand>(
+            r#"{"type":"get_input_receipts","activeSessionId":"s","queueKey":"exact"}"#,
+        );
+    }
+
+    #[test]
+    fn prompt_family_roundtrip() {
+        rt::<DaemonCommand>(
+            r#"{"type":"steer","activeSessionId":"s1","message":"m","content":[{"type":"text","text":"x"}],"streamingBehavior":"steer","queueKey":"q","admissionId":"a1"}"#,
+        );
+        rt::<DaemonCommand>(
+            r#"{"type":"cancel_prompt_admission","activeSessionId":"s1","admissionId":"a1","cancelOwned":true}"#,
+        );
+    }
+
+    #[test]
+    fn worker_register_roundtrip() {
+        rt::<DaemonCommand>(
+            r#"{"type":"worker_register","activeSessionId":"abc123def456","sessionId":"s-uuid","socketPath":"/tmp/w.sock","workerInstanceId":"inst-1","token":"tok","pid":4242}"#,
+        );
+    }
+
+    #[test]
+    fn mark_anthropic_warning_shown_roundtrip() {
+        rt::<DaemonCommand>(r#"{"type":"mark_anthropic_warning_shown","activeSessionId":"s1"}"#);
+    }
+}

@@ -1,0 +1,803 @@
+//! LLM-facing message conversion (TS `convertToLlm` plus the message
+//! presentation constants).
+
+use super::agent_messaging::sanitize_message_header_value;
+use crate::cron::AgentCronJob;
+use pa_types::ai::{
+    AssistantMessage, TextContent, ToolResultMessage, UserContent, UserContentBlock, UserMessage,
+};
+use pa_types::session::AgentMessage;
+use std::fmt::Write as _;
+
+pub const COMPACTION_SUMMARY_PREFIX: &str = "[compaction-summary]\n\nThe conversation history before this point was compacted into the following summary.\nThe retained messages below are authoritative; this summary may lag behind them.\nBackground work may have progressed during compaction; treat resource statuses as last-observed and refresh them before relying on them.\n\n<summary>\n";
+pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+pub const BRANCH_SUMMARY_PREFIX: &str = "[branch-summary]\n\nThe following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+pub const BRANCH_SUMMARY_SUFFIX: &str = "\n</summary>";
+pub const HARNESS_DIGEST_PREFIX: &str = "[harness-digest]\n\nThe persistent memories produced across this session so far:\n\n<harness_state>\n";
+pub const HARNESS_DIGEST_SUFFIX: &str = "\n</harness_state>";
+
+pub use pa_types::slash_commands::{
+    SESSION_SLASH_COMMAND_CUSTOM_TYPE, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+};
+pub const COMPACTION_OUTCOME_CUSTOM_TYPE: &str = "compaction_outcome";
+pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";
+pub const REFINEMENT_NOTICE_CUSTOM_TYPE: &str = "refinement_notice";
+/// The durable single-row disclosure of one provider-retry episode (SANCTIONED
+/// DIVERGENCE, operator ruling 2026-09-23): a user-facing disclosure, never
+/// model context — `convert_to_llm` drops it.
+pub const PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE: &str = "provider_retry_outcome";
+/// TS `MCP_CONNECTION_OUTCOME_CUSTOM_TYPE`: the durable row an MCP
+/// connect/disconnect leaves in the transcript (produced by the TS-era
+/// daemon; the row is bookkeeping, never model context).
+pub const MCP_CONNECTION_OUTCOME_CUSTOM_TYPE: &str = "mcp_connection_outcome";
+pub const HEARTBEAT_PROMPT_CUSTOM_TYPE: &str = "heartbeat_prompt";
+/// The durable row a detached kernel bash completion admits as the
+/// woken turn's injected prompt.
+pub const ASYNC_BASH_COMPLETION_CUSTOM_TYPE: &str = "async_bash_completion";
+/// TS `SESSION_RENAMED_CUSTOM_TYPE` (#2529): the displayed notice a
+/// rename that changed an existing name leaves in the renamed session's
+/// transcript.
+pub const SESSION_RENAMED_CUSTOM_TYPE: &str = "session_renamed";
+/// TS `ASYNC_BASH_COMPLETION_PREVIEW_LABEL`: the queue-strip label the
+/// notice's queued row carries (the TUI renders it with its own label,
+/// no lane prefix).
+pub const ASYNC_BASH_COMPLETION_PREVIEW_LABEL: &str = "Background command finished";
+/// The durable row a factory run milestone (`factory.progress`) admits on
+/// the owning session's steering lane.
+pub const FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE: &str = "factory_progress_notice";
+/// The queue-strip label the factory progress notice's queued row carries.
+pub const FACTORY_PROGRESS_PREVIEW_LABEL: &str = "Factory progress";
+/// The queue-strip preview label for a parked heartbeat fire; the queued row reads
+/// `Heartbeat prompt: <content>` instead of the lane-labeled preview.
+pub const HEARTBEAT_PROMPT_PREVIEW_LABEL: &str = "Heartbeat prompt";
+
+/// Why an unsuccessful compaction ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionOutcomeReason {
+    Threshold,
+    Overflow,
+    Requested,
+}
+
+impl CompactionOutcomeReason {
+    /// The wire `reason` string: the outcome row's `details.reason` and the
+    /// `compaction_end` event's `reason`.
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Threshold => "threshold",
+            Self::Overflow => "overflow",
+            Self::Requested => "requested",
+        }
+    }
+}
+
+/// How an unsuccessful compaction ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionOutcomeKind {
+    /// Nothing to summarize (TS `CompactionSkippedError`).
+    Skipped,
+    /// Aborted mid-run.
+    Cancelled,
+    /// The summarization failed.
+    Failed,
+}
+
+impl CompactionOutcomeKind {
+    /// The wire `outcome` string: the outcome row's `details.outcome`.
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+/// The ONE line a recovered episode leaves in the chat, replacing the
+/// per-attempt error rows TS keeps.
+#[must_use]
+pub fn provider_retry_recovered_text(attempts: u32, last_error: &str) -> String {
+    format!("Recovered after {attempts} retries: {last_error}")
+}
+
+/// The terminal-line text of a retry episode that gave up: the same text the TS
+/// `auto_retry_end` live row carries. A zero-attempt failure never retried — TS
+/// never emits this shape.
+#[must_use]
+pub fn provider_retry_exhausted_text(attempts: u32, final_error: &str) -> String {
+    if attempts == 0 {
+        format!("\u{26a0} Error: {final_error}")
+    } else {
+        format!("\u{26a0} Error: Retry failed after {attempts} attempts: {final_error}")
+    }
+}
+
+/// The durable disclosure row of one provider-retry episode.
+#[must_use]
+pub fn create_provider_retry_outcome_message(
+    success: bool,
+    attempts: u32,
+    error: &str,
+) -> pa_types::session::CustomMessage {
+    let content = if success {
+        provider_retry_recovered_text(attempts, error)
+    } else {
+        provider_retry_exhausted_text(attempts, error)
+    };
+    pa_types::session::CustomMessage {
+        custom_type: PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(content),
+        display: true,
+        details: Some(serde_json::json!({
+            "success": success,
+            "attempts": attempts,
+            "finalError": error,
+        })),
+        timestamp: now_millis(),
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// The durable disclosure row for an unsuccessful compaction: never
+/// model context — `convert_to_llm` drops it, so the KV-cacheable
+/// prefix is unaffected.
+#[must_use]
+pub fn create_compaction_outcome_message(
+    content: &str,
+    reason: CompactionOutcomeReason,
+    outcome: CompactionOutcomeKind,
+) -> pa_types::session::CustomMessage {
+    pa_types::session::CustomMessage {
+        custom_type: COMPACTION_OUTCOME_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(content.to_string()),
+        display: true,
+        details: Some(serde_json::json!({
+            "reason": reason.wire(),
+            "outcome": outcome.wire(),
+        })),
+        timestamp: now_millis(),
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// The durable heartbeat delivery row: the job's prompt under the `[heartbeat:
+/// <schedule> run#<n>]` header, with the run bookkeeping in details.
+#[must_use]
+pub fn create_heartbeat_prompt_message(
+    job: &AgentCronJob,
+    timestamp: u64,
+) -> pa_types::session::CustomMessage {
+    let schedule = sanitize_message_header_value(&job.schedule.expression);
+    let content = format!(
+        "[heartbeat: {schedule} run#{}]\n\n{}",
+        job.run_count, job.prompt
+    );
+    // The details block mirrors the TS JSON exactly: the fixed keys in the TS
+    // order, and the optional `nextRunAt`/`lastRunAt` omitted while undefined (TS
+    // `JSON.stringify` drops undefined fields, so a first fire carries no `lastRunAt`).
+    let mut details = serde_json::Map::new();
+    details.insert("jobId".to_string(), serde_json::json!(job.id));
+    details.insert(
+        "schedule".to_string(),
+        serde_json::json!(job.schedule.expression),
+    );
+    details.insert(
+        "status".to_string(),
+        serde_json::to_value(job.status).unwrap_or(serde_json::Value::Null),
+    );
+    details.insert("runCount".to_string(), serde_json::json!(job.run_count));
+    if let Some(next_run_at) = &job.next_run_at {
+        details.insert("nextRunAt".to_string(), serde_json::json!(next_run_at));
+    }
+    if let Some(last_run_at) = &job.last_run_at {
+        details.insert("lastRunAt".to_string(), serde_json::json!(last_run_at));
+    }
+    pa_types::session::CustomMessage {
+        custom_type: HEARTBEAT_PROMPT_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(content),
+        display: true,
+        details: Some(serde_json::Value::Object(details)),
+        timestamp,
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// The detached kernel bash completion notice: the `[bash-done pid:N exit:M]` header
+/// plus the JSON-encoded command. A later kernel read that reaches the model first
+/// withdraws it through its details (`bash.consumed`).
+#[must_use]
+pub fn create_async_bash_completion_message(
+    pid: u32,
+    command: &str,
+    exit_code: i64,
+    timestamp: u64,
+) -> pa_types::session::CustomMessage {
+    // TS `JSON.stringify(details.command)`: the quoted, escaped command.
+    let encoded_command = serde_json::to_string(command).unwrap_or_default();
+    let content = format!("[bash-done pid:{pid} exit:{exit_code}]\n\nCommand: {encoded_command}");
+    pa_types::session::CustomMessage {
+        custom_type: ASYNC_BASH_COMPLETION_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(content),
+        display: true,
+        details: Some(serde_json::json!({
+            "pid": pid,
+            "command": command,
+            "exitCode": exit_code,
+        })),
+        timestamp,
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// The factory run milestone notice: `[factory-progress run:<id>] <kind>: <detail>`,
+/// the kernel's `snake_case` kind rendered with hyphens (`budget_exceeded` reads
+/// `budget-exceeded`). The details keep the kernel's raw values.
+#[must_use]
+pub fn create_factory_progress_message(
+    run_id: &str,
+    kind: &str,
+    node: Option<&str>,
+    detail: &str,
+    timestamp: u64,
+) -> pa_types::session::CustomMessage {
+    let header_run = sanitize_message_header_value(run_id);
+    let header_kind = sanitize_message_header_value(&kind.replace('_', "-"));
+    let mut details = serde_json::json!({ "runId": run_id, "kind": kind, "detail": detail });
+    if let Some(node) = node {
+        details["node"] = serde_json::json!(node);
+    }
+    pa_types::session::CustomMessage {
+        custom_type: FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(format!(
+            "[factory-progress run:{header_run}] {header_kind}: {detail}"
+        )),
+        display: true,
+        details: Some(details),
+        timestamp,
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// Bash output rendered as a fenced block with a fence longer than any
+/// backtick run inside the output.
+fn bash_output_to_text(
+    output: &str,
+    exit_code: Option<i64>,
+    cancelled: bool,
+    truncated: bool,
+    full_output_path: Option<&str>,
+) -> String {
+    let mut text = String::new();
+    if output.is_empty() {
+        text.push_str("(no output)");
+    } else {
+        let longest = output
+            .match_indices('`')
+            .fold(0usize, |longest, (index, _)| {
+                let mut run = 0usize;
+                let mut chars = output[index..].chars();
+                while chars.next() == Some('`') {
+                    run += 1;
+                }
+                run.max(longest)
+            });
+        let fence = "`".repeat(longest.max(3).max(longest + 1));
+        text.push_str(&fence);
+        text.push('\n');
+        text.push_str(output);
+        text.push('\n');
+        text.push_str(&fence);
+    }
+    if cancelled {
+        text.push_str("\n\n(command cancelled)");
+    } else if let Some(code) = exit_code {
+        if code != 0 {
+            let _ = write!(text, "\n\nCommand exited with code {code}");
+        }
+    }
+    if truncated {
+        match full_output_path {
+            Some(path) => {
+                let _ = write!(text, "\n\n[Output truncated. Full output: {path}]");
+            }
+            None => text.push_str("\n\n[Output truncated.]"),
+        }
+    }
+    text
+}
+
+/// Bash execution as user-facing text for LLM context.
+#[must_use]
+pub fn bash_execution_to_text(message: &pa_types::session::BashExecutionMessage) -> String {
+    format!(
+        "Ran `{}`\n{}",
+        message.command,
+        bash_output_to_text(
+            &message.output,
+            message.exit_code,
+            message.cancelled,
+            message.truncated,
+            message.full_output_path.as_deref(),
+        )
+    )
+}
+
+fn text_block(text: String) -> UserContentBlock {
+    UserContentBlock::Text(TextContent {
+        text,
+        text_signature: None,
+        rest: serde_json::Map::default(),
+    })
+}
+
+/// The LLM message view of session messages: session-only roles become user
+/// text turns; bookkeeping custom types drop out entirely.
+#[must_use]
+pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    let mut out = Vec::new();
+    for message in messages {
+        let converted = match message {
+            AgentMessage::BashExecution(bash) => {
+                if bash.exclude_from_context.unwrap_or(false) {
+                    continue;
+                }
+                AgentMessage::User(UserMessage {
+                    content: UserContent::Blocks(vec![text_block(bash_execution_to_text(bash))]),
+                    timestamp: bash.timestamp,
+                    rest: serde_json::Map::default(),
+                })
+            }
+            AgentMessage::Custom(custom) => {
+                if matches!(
+                    custom.custom_type.as_str(),
+                    SESSION_SLASH_COMMAND_CUSTOM_TYPE
+                        | SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
+                        | COMPACTION_OUTCOME_CUSTOM_TYPE
+                        | MCP_CONNECTION_OUTCOME_CUSTOM_TYPE
+                        | REFINEMENT_OUTCOME_CUSTOM_TYPE
+                        | PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE
+                        | crate::prompts::model_prompts::MODEL_PROMPT_ERROR_CUSTOM_TYPE
+                ) {
+                    continue;
+                }
+                // TS wraps a string content into a text-part array and
+                // passes block content through (the request's cacheable
+                // shape is the array either way).
+                let content = match custom.content.clone() {
+                    UserContent::Text(text) => UserContent::Blocks(vec![text_block(text)]),
+                    blocks @ UserContent::Blocks(_) => blocks,
+                };
+                AgentMessage::User(UserMessage {
+                    content,
+                    timestamp: custom.timestamp,
+                    rest: serde_json::Map::default(),
+                })
+            }
+            AgentMessage::BranchSummary(summary) => AgentMessage::User(UserMessage {
+                content: UserContent::Blocks(vec![text_block(format!(
+                    "{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}",
+                    summary.summary
+                ))]),
+                timestamp: summary.timestamp,
+                rest: serde_json::Map::default(),
+            }),
+            AgentMessage::CompactionSummary(summary) => {
+                let digest_block = summary
+                    .harness_digest
+                    .as_deref()
+                    .map(|digest| {
+                        format!("{HARNESS_DIGEST_PREFIX}{digest}{HARNESS_DIGEST_SUFFIX}\n\n")
+                    })
+                    .unwrap_or_default();
+                AgentMessage::User(UserMessage {
+                    content: UserContent::Blocks(vec![text_block(format!(
+                        "{digest_block}{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
+                        summary.summary
+                    ))]),
+                    timestamp: summary.timestamp,
+                    rest: serde_json::Map::default(),
+                })
+            }
+            AgentMessage::User(_) | AgentMessage::Assistant(_) | AgentMessage::ToolResult(_) => {
+                message.clone()
+            }
+        };
+        out.push(converted);
+    }
+    out
+}
+
+/// Convenience alias types used by the summarizer call.
+pub type LlmAssistantMessage = AssistantMessage;
+pub type LlmToolResultMessage = ToolResultMessage;
+
+/// The loop-boundary LLM conversion wired into the agent's seam: standard rows pass
+/// through; custom rows cross through the session wire shape so the session conversion
+/// rules apply (what lets the harness-digest row ride the loop to the provider).
+#[must_use]
+pub fn loop_convert_to_llm(
+    messages: Vec<pa_agent::types::AgentMessage>,
+) -> Vec<pa_agent::types::Message> {
+    let mut out = Vec::new();
+    for message in messages {
+        match message {
+            pa_agent::types::AgentMessage::Standard(message) => out.push(message),
+            pa_agent::types::AgentMessage::Custom(custom) => {
+                let Some(session_message) = custom_message_to_session(&custom) else {
+                    continue;
+                };
+                for converted in convert_to_llm(std::slice::from_ref(&session_message)) {
+                    if let Some(message) = session_llm_row_to_loop(&converted) {
+                        out.push(message);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One loop custom row as its session wire shape, when it matches a known session
+/// role; unknown shapes read as unconvertible (TS drops them via the default arm).
+fn custom_message_to_session(custom: &pa_agent::types::CustomAgentMessage) -> Option<AgentMessage> {
+    let wire = serde_json::to_value(custom).ok()?;
+    serde_json::from_value(wire).ok()
+}
+
+/// One converted session row back into its loop wire shape (the shared camelCase wire
+/// form crosses the pa-core/pa-agent boundary by JSON round-trip).
+fn session_llm_row_to_loop(message: &AgentMessage) -> Option<pa_agent::types::Message> {
+    serde_json::from_value(serde_json::to_value(message).ok()?).ok()
+}
+
+/// The `ConvertToLlmFn` handed to the pa-agent loop: infallible by contract
+/// (a failed wire round-trip drops the row, mirroring the TS default arm).
+#[must_use]
+pub fn engine_convert_to_llm() -> pa_agent::agent_loop::ConvertToLlmFn {
+    std::sync::Arc::new(|messages: Vec<pa_agent::types::AgentMessage>| {
+        Box::pin(async move { Ok(loop_convert_to_llm(messages)) })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SANCTIONED DIVERGENCE, operator ruling 2026-09-23: one durable
+    /// line per episode, never model context.
+    #[test]
+    fn provider_retry_outcome_row_is_the_one_line_and_never_context() {
+        let recovered =
+            create_provider_retry_outcome_message(true, 3, "429 Too many concurrent requests");
+        assert_eq!(recovered.custom_type, PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE);
+        assert_eq!(
+            recovered.content,
+            UserContent::Text(
+                "Recovered after 3 retries: 429 Too many concurrent requests".to_string()
+            )
+        );
+        assert!(recovered.display);
+        assert_eq!(
+            recovered.details,
+            Some(serde_json::json!({
+                "success": true,
+                "attempts": 3,
+                "finalError": "429 Too many concurrent requests",
+            }))
+        );
+        let exhausted = create_provider_retry_outcome_message(false, 2, "provider down");
+        assert_eq!(
+            exhausted.content,
+            UserContent::Text(
+                "\u{26a0} Error: Retry failed after 2 attempts: provider down".to_string()
+            )
+        );
+        let converted = convert_to_llm(&[AgentMessage::Custom(recovered)]);
+        assert!(
+            converted.is_empty(),
+            "outcome row must not convert to LLM context"
+        );
+    }
+
+    #[test]
+    fn model_prompt_error_row_is_never_context() {
+        let message = crate::prompts::model_prompts::model_prompt_error_message(&[
+            "/x/model-prompts.toml: bad TOML".to_string(),
+        ]);
+        assert!(convert_to_llm(&[AgentMessage::Custom(message)]).is_empty());
+    }
+
+    /// TS `MCP_CONNECTION_OUTCOME_CUSTOM_TYPE`: the durable MCP
+    /// login/disconnect line is bookkeeping, never model context.
+    #[test]
+    fn mcp_connection_outcome_row_is_never_context() {
+        // The literal is the on-disk value a TS-era session file carries.
+        let message = pa_types::session::CustomMessage {
+            custom_type: "mcp_connection_outcome".to_string(),
+            content: UserContent::Text("Connected acme (12 tools verified).".to_string()),
+            display: true,
+            details: None,
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        };
+        assert!(
+            convert_to_llm(&[AgentMessage::Custom(message)]).is_empty(),
+            "the MCP connection outcome row must drop out of model context"
+        );
+    }
+
+    #[test]
+    fn bash_output_fences_and_status() {
+        let rendered = bash_output_to_text(
+            "has `ticks` inside",
+            Some(1),
+            false,
+            true,
+            Some("/tmp/full.txt"),
+        );
+        assert!(rendered.contains("```\nhas `ticks` inside\n```")); // default fence
+        assert!(rendered.contains("Command exited with code 1"));
+        assert!(rendered.contains("[Output truncated. Full output: /tmp/full.txt]"));
+        assert!(bash_output_to_text("", None, false, false, None).contains("(no output)"));
+        let cancelled = bash_output_to_text("x", None, true, false, None);
+        assert!(cancelled.contains("(command cancelled)"));
+        // A 3-backtick run in the output forces a 4-backtick fence.
+        let fenced = bash_output_to_text("a ``` b", None, false, false, None);
+        assert!(fenced.contains("````\na ``` b\n````"));
+    }
+
+    #[test]
+    fn conversion_wraps_summaries_and_drops_bookkeeping() {
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("keep me".to_string()),
+                timestamp: 0,
+                rest: serde_json::Map::default(),
+            }),
+            AgentMessage::Custom(pa_types::session::CustomMessage {
+                custom_type: SESSION_SLASH_COMMAND_CUSTOM_TYPE.to_string(),
+                content: UserContent::Text("/model".to_string()),
+                display: true,
+                details: None,
+                timestamp: 0,
+                rest: serde_json::Map::default(),
+            }),
+            AgentMessage::Custom(pa_types::session::CustomMessage {
+                custom_type: "arbitrary_note".to_string(),
+                content: UserContent::Text("a note".to_string()),
+                display: true,
+                details: None,
+                timestamp: 0,
+                rest: serde_json::Map::default(),
+            }),
+            AgentMessage::BranchSummary(pa_types::session::BranchSummaryMessage {
+                summary: "the branch".to_string(),
+                from_id: "x".to_string(),
+                timestamp: 0,
+            }),
+            AgentMessage::CompactionSummary(pa_types::session::CompactionSummaryMessage {
+                summary: "the story".to_string(),
+                tokens_before: 1,
+                retained_message_count: None,
+                custom_instructions: None,
+                harness_digest: Some("digest".to_string()),
+                harness_state_fingerprint: None,
+                timestamp: 0,
+            }),
+        ];
+        let converted = convert_to_llm(&messages);
+        assert_eq!(converted.len(), 4);
+        assert!(matches!(converted[0], AgentMessage::User(_)));
+        let note = match &converted[1] {
+            AgentMessage::User(user) => user.content.text(),
+            _ => panic!("expected user"),
+        };
+        assert_eq!(note, "a note");
+        let branch = match &converted[2] {
+            AgentMessage::User(user) => user.content.text(),
+            _ => panic!("expected user"),
+        };
+        assert!(branch.contains("[branch-summary]"));
+        assert!(branch.contains("the branch"));
+        let compaction = match &converted[3] {
+            AgentMessage::User(user) => user.content.text(),
+            _ => panic!("expected user"),
+        };
+        assert!(compaction.contains("[harness-digest]"));
+        assert!(compaction.contains("<harness_state>\ndigest\n</harness_state>"));
+        assert!(compaction.contains("[compaction-summary]"));
+        assert!(compaction.contains("the story"));
+    }
+
+    #[test]
+    fn loop_conversion_applies_session_rules_to_custom_rows() {
+        let digest_row: pa_agent::types::AgentMessage = serde_json::from_value(serde_json::json!({
+            "role": "custom",
+            "customType": "harness_digest",
+            "content": "[harness-digest]
+
+<harness_state>
+state
+</harness_state>",
+            "display": false,
+            "details": { "digest": "state" },
+            "timestamp": 5
+        }))
+        .unwrap();
+        let outcome_row: pa_agent::types::AgentMessage =
+            serde_json::from_value(serde_json::json!({
+                "role": "custom",
+                "customType": "compaction_outcome",
+                "content": "compacted",
+                "display": true,
+                "details": { "reason": "threshold", "outcome": "failed" },
+                "timestamp": 6
+            }))
+            .unwrap();
+        let unknown_row: pa_agent::types::AgentMessage =
+            serde_json::from_value(serde_json::json!({ "role": "arbitrary", "payload": "x" }))
+                .unwrap();
+        let user = pa_agent::types::AgentMessage::user("keep");
+        let converted = loop_convert_to_llm(vec![digest_row, user, outcome_row, unknown_row]);
+        assert_eq!(converted.len(), 2);
+        match &converted[0] {
+            pa_agent::types::Message::User(user) => {
+                // The digest row converts to a text-part array, not a
+                // bare string.
+                assert!(
+                    matches!(&user.content, pa_agent::types::UserContent::Parts(parts)
+                        if parts.iter().any(|part| matches!(part,
+                            pa_agent::types::UserPart::Text(text)
+                                if text.text.contains("[harness-digest]"))))
+                );
+                assert_eq!(user.timestamp, 5);
+            }
+            _ => panic!("expected user message"),
+        }
+        match &converted[1] {
+            pa_agent::types::Message::User(user) => {
+                assert!(
+                    matches!(&user.content, pa_agent::types::UserContent::Text(text)
+                        if text == "keep")
+                );
+            }
+            _ => panic!("expected user message"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_prompt_message_matches_the_ts_shape() {
+        let job = AgentCronJob {
+            id: "job-1".to_string(),
+            status: crate::cron::JobStatus::Active,
+            source: Some("rlm_heartbeat".to_string()),
+            runtime_kind: None,
+            delivery_mode: Some(crate::cron::DeliveryMode::Steer),
+            active_session_id: "live-1".to_string(),
+            session_id: "session-1".to_string(),
+            session_file: "/w/session.jsonl".to_string(),
+            cwd: "/w".to_string(),
+            label: Some("mission".to_string()),
+            prompt: "check the mission".to_string(),
+            schedule: crate::cron::AgentCronSchedule {
+                kind: crate::cron::ScheduleKind::Interval,
+                expression: "every 10m".to_string(),
+                interval_ms: Some(600_000),
+            },
+            created_at: "2026-09-22T00:00:00.000Z".to_string(),
+            updated_at: "2026-09-22T00:00:00.000Z".to_string(),
+            next_run_at: Some("2026-09-22T00:10:00.000Z".to_string()),
+            last_run_at: None,
+            last_skipped_at: None,
+            last_error: None,
+            run_count: 0,
+        };
+        let message = create_heartbeat_prompt_message(&job, 1_000);
+        assert_eq!(message.custom_type, "heartbeat_prompt");
+        assert!(message.display);
+        assert_eq!(message.timestamp, 1_000);
+        // The header sanitizes its schedule value.
+        assert_eq!(
+            message.content,
+            UserContent::Text("[heartbeat: every 10m run#0]\n\ncheck the mission".to_string())
+        );
+        let details = message.details.unwrap();
+        assert_eq!(details["jobId"], "job-1");
+        assert_eq!(details["schedule"], "every 10m");
+        assert_eq!(details["status"], "active");
+        assert_eq!(details["runCount"], 0);
+        assert_eq!(details["nextRunAt"], "2026-09-22T00:10:00.000Z");
+        // An undefined lastRunAt is omitted, not null (TS JSON.stringify
+        // drops undefined fields; a first fire carries no lastRunAt).
+        assert!(details.get("lastRunAt").is_none());
+        let delimited = crate::cron::AgentCronJob {
+            schedule: crate::cron::AgentCronSchedule {
+                kind: crate::cron::ScheduleKind::Cron,
+                expression: "0 0,12:every[day]".to_string(),
+                interval_ms: None,
+            },
+            ..job.clone()
+        };
+        let message = create_heartbeat_prompt_message(&delimited, 2_000);
+        assert!(matches!(message.content, UserContent::Text(text)
+                if text.starts_with("[heartbeat: 0 0 12 every day run#0]")));
+        let repeat = crate::cron::AgentCronJob {
+            last_run_at: Some("2026-09-22T00:10:00.000Z".to_string()),
+            run_count: 1,
+            ..job
+        };
+        let message = create_heartbeat_prompt_message(&repeat, 2_000);
+        assert!(matches!(message.content, UserContent::Text(text)
+                if text.starts_with("[heartbeat: every 10m run#1]")));
+        let details = message.details.unwrap();
+        assert_eq!(details["runCount"], 1);
+        assert_eq!(details["lastRunAt"], "2026-09-22T00:10:00.000Z");
+    }
+
+    #[test]
+    fn async_bash_completion_message_matches_the_ts_shape() {
+        let message =
+            create_async_bash_completion_message(4321, "sleep 12; echo RW_WAKE_DONE", 0, 1_000);
+        assert_eq!(message.custom_type, "async_bash_completion");
+        assert!(message.display);
+        assert_eq!(message.timestamp, 1_000);
+        assert_eq!(
+            message.content,
+            UserContent::Text(
+                "[bash-done pid:4321 exit:0]\n\nCommand: \"sleep 12; echo RW_WAKE_DONE\""
+                    .to_string()
+            )
+        );
+        let details = message.details.unwrap();
+        assert_eq!(details["pid"], 4321);
+        assert_eq!(details["command"], "sleep 12; echo RW_WAKE_DONE");
+        assert_eq!(details["exitCode"], 0);
+        let message = create_async_bash_completion_message(11, "echo \"done\" && exit 2", 2, 2_000);
+        assert_eq!(message.timestamp, 2_000);
+        assert!(matches!(message.content, UserContent::Text(text)
+            if text.starts_with("[bash-done pid:11 exit:2]\n\nCommand: \"echo \\\"done\\\" && exit 2\"")));
+        let details = message.details.unwrap();
+        assert_eq!(details["exitCode"], 2);
+    }
+
+    #[test]
+    fn bash_execution_becomes_user_text() {
+        let bash = AgentMessage::BashExecution(pa_types::session::BashExecutionMessage {
+            command: "cargo test".to_string(),
+            output: "ok".to_string(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            timestamp: 0,
+            exclude_from_context: None,
+        });
+        let converted = convert_to_llm(std::slice::from_ref(&bash));
+        match &converted[0] {
+            AgentMessage::User(user) => {
+                assert!(user.content.text().starts_with("Ran `cargo test`"));
+                assert!(user.content.text().contains("```"));
+            }
+            _ => panic!("expected user"),
+        }
+        let excluded = AgentMessage::BashExecution(pa_types::session::BashExecutionMessage {
+            exclude_from_context: Some(true),
+            command: "secret".to_string(),
+            output: String::new(),
+            exit_code: None,
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            timestamp: 0,
+        });
+        assert!(convert_to_llm(std::slice::from_ref(&excluded)).is_empty());
+    }
+}

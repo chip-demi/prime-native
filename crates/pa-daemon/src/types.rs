@@ -1,0 +1,285 @@
+//! Shared wire DTOs for the daemon protocol (session summaries,
+//! connection state, queue snapshots, agent messages). Message payloads
+//! are carried as raw JSON (`serde_json::Value`) so the daemon stays
+//! forward-compatible with the agent-loop lane's message evolution.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub type AgentMessage = Value;
+
+/// Extract the text of a message content field (string or content blocks).
+#[must_use]
+pub fn message_text(message: &Value) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    content_to_text(content)
+}
+
+#[must_use]
+pub fn content_to_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    block.get("text").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+pub fn message_role(message: &Value) -> Option<&str> {
+    message.get("role").and_then(Value::as_str)
+}
+
+pub fn message_timestamp_ms(message: &Value) -> Option<u64> {
+    message.get("timestamp").and_then(Value::as_u64)
+}
+
+/// The lightweight session shape for list/create/rename/attach/state responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub id: String,
+    pub lifecycle: String,
+    pub activity: String,
+    pub is_session_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_registered_cron_job: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rlm_depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    pub is_streaming: bool,
+    pub is_compacting: bool,
+    /// True while the session is parked waiting out a provider-reported
+    /// usage reset (TS `session.isQuotaParked`); the parked banner names the wake time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_quota_parked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_bash_running: Option<bool>,
+    /// A live kernel-owned bash handle still owes a result or completion notice.
+    #[serde(default)]
+    pub has_background_bash: bool,
+    /// A streaming turn with tool calls in flight (TS `isRunningTools`: `isStreaming &&
+    /// pendingToolCalls.size > 0`); drives the agents-view activity label's `running tools` state.
+    #[serde(default)]
+    pub is_running_tools: bool,
+    /// An RLM child of this session (or one of its descendants) is still
+    /// running; the session counts as working even after its own turn
+    /// ended.
+    #[serde(default)]
+    pub has_running_subagents: bool,
+    pub attached_clients: u32,
+    pub message_count: u32,
+    pub session_actions: SessionActionSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_message: Option<AgentMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
+    /// The run's latest accepted `rlm.progress.note`, cleared at the run
+    /// boundaries so an idle row never carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_note: Option<String>,
+    /// The session's tool calls so far (TS `toolUseCount`, omitted when
+    /// zero): bumped per `tool_execution_start`, re-seeded from the session
+    /// file when a worker opens it so a revived child never resets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_path: Option<String>,
+    /// The parent's live active-session id (subagent summaries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_active_session_id: Option<String>,
+    /// The parent's persisted session id (subagent summaries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// This subagent's child id under its parent (unique per parent; the
+    /// roster agent id qualifies it with the parent path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rlm_child_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_pid: Option<u32>,
+    /// The worker's roster-delta sequence counter at snapshot time: the pull gate keys it in the
+    /// same lock section, so a delta still in flight when the pull answered drops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_delta_sequence: Option<u64>,
+    /// The worker process instance that took this summary (stamped with
+    /// [`SessionSummary::roster_delta_sequence`]): the pull gate keys its
+    /// watermark by the answering generation, never the last registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Value>,
+    /// TS `modelFallbackMessage`: why a revived session's saved model
+    /// fell back (the restore missed the catalog-readiness window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_fallback_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfinished_action_count: Option<u32>,
+    /// Whether this session has already drawn the Anthropic subscription
+    /// ban-risk warning (Rust-native, operator directive 2026-09-29): the
+    /// once-per-session-lifecycle gate the interactive client reads from
+    /// `get_state` before warning — a reattach or a resume of the same
+    /// session skips, a genuinely new session warns once. Absent when the
+    /// session is still initializing (older workers never emit it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_warning_shown: Option<bool>,
+}
+
+/// The session action snapshot (TS `SessionActionSnapshot`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionActionSnapshot {
+    pub queued_count: u32,
+    pub steering: Vec<String>,
+    pub follow_ups: Vec<String>,
+    /// Rust-native typed provenance the TS snapshot has no counterpart for: which parked lane items
+    /// are RLM child status notices, by index (the lane strings stay the TS preview verbatim).
+    #[serde(default, skip_serializing_if = "QueueLaneIndices::is_empty")]
+    pub rlm_child_status: QueueLaneIndices,
+    /// Rust-native typed provenance: which parked lane items are
+    /// engine-minted internal prompts (TS's projection filters them
+    /// out), by index (operator directive 2026-09-28: internal prompts
+    /// never render as individual rows).
+    #[serde(default, skip_serializing_if = "QueueLaneIndices::is_empty")]
+    pub injected_prompts: QueueLaneIndices,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<SessionActionActive>,
+}
+
+/// The lane-indices rider shape the typed-provenance marks share: parked lane items, by index, of
+/// one internal class — a user-typed lookalike never carries either mark.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueLaneIndices {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steering: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follow_up: Vec<usize>,
+}
+
+impl QueueLaneIndices {
+    /// Whether no lane item is marked (the wire omits the rider then, so
+    /// a notice-free projection serializes byte-identical to TS).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steering.is_empty() && self.follow_up.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionActionActive {
+    pub kind: String,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Port of `AgentConnectionState` (modes/agent-connection/types.ts), the
+/// per-session state block inside attach snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConnectionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<String>,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Value>,
+    pub thinking_level: String,
+    pub service_tier: String,
+    pub available_thinking_levels: Vec<String>,
+    pub is_streaming: bool,
+    pub is_compacting: bool,
+    pub is_bash_running: bool,
+    pub retry_attempt: u32,
+    pub steering_mode: String,
+    pub follow_up_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<String>,
+    #[serde(default)]
+    pub leaf_id: Option<String>,
+    pub auto_compaction_enabled: bool,
+    pub message_count: u32,
+    pub session_actions: SessionActionSnapshot,
+    pub compaction_count: u32,
+    pub goal: Value,
+    #[serde(default)]
+    pub scoped_models: Vec<Value>,
+    #[serde(default)]
+    pub active_tool_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_text_from_content_blocks() {
+        let message = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello "}, {"type": "image"}, {"type": "text", "text": "world"}],
+        });
+        assert_eq!(message_text(&message), "hello  world");
+        assert_eq!(message_role(&message), Some("user"));
+    }
+
+    #[test]
+    fn session_summary_serializes_snake_case_and_reads_camel_case() {
+        let wire = r#"{
+            "id": "abc123def456",
+            "lifecycle": "live",
+            "activity": "idle",
+            "isSessionActive": false,
+            "sessionId": "sess",
+            "cwd": "/tmp",
+            "isStreaming": false,
+            "isCompacting": false,
+            "attachedClients": 1,
+            "messageCount": 3,
+            "sessionActions": {"queuedCount": 0, "steering": [], "followUps": []}
+        }"#;
+        let summary: SessionSummary =
+            serde_json::from_str(wire).expect("parses camelCase wire format");
+        assert_eq!(summary.message_count, 3);
+        let out = serde_json::to_value(&summary).unwrap();
+        assert_eq!(out["messageCount"], 3);
+    }
+}

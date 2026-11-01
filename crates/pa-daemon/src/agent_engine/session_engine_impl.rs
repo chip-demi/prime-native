@@ -1,0 +1,1851 @@
+//! The `SessionEngine` trait impl for [`AgentSessionEngine`]: the
+//! worker-facing engine contract - model and goal config surfaces, the
+//! turn state machine, and the export/telemetry reads.
+
+use super::{
+    artifact_reference, json, map_thinking_level, now_millis, AgentSessionEngine, Arc,
+    BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun, CompactionOutcome,
+    CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection, ParentIdentity,
+    PromptContextBoundary, PromptRequest, ProviderTarget, SessionEngine, SideQuestionOutcome,
+    SideQuestionRequest, StartupScope, TurnPrompt, Value, DEFAULT_RLM_MAX_DEPTH,
+};
+
+impl SessionEngine for AgentSessionEngine {
+    fn owner_bootstrap(
+        &self,
+        payload: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let goal = self.current_goal_state();
+            anyhow::ensure!(
+                goal.as_ref().and_then(|g| g.goal_id.as_deref())
+                    == payload["expectedGoalId"].as_str()
+                    && goal
+                        .as_ref()
+                        .is_some_and(|g| g.status == pa_core::goals::GoalStatus::Active),
+                "Owner goal changed"
+            );
+            let children = self
+                .children
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Children unavailable"))?;
+            children
+                .owner_bootstrap(&payload, &|commit: &mut dyn FnMut() -> anyhow::Result<
+                    Value,
+                >| {
+                    let handles = self
+                        .goal_runtime
+                        .lock()
+                        .expect("goal runtime lock")
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Owner goal unavailable"))?;
+                    let driver = handles
+                        .driver
+                        .try_lock()
+                        .map_err(|_| anyhow::anyhow!("Owner goal busy"))?;
+                    let current = driver.state_with_creation_elapsed();
+                    anyhow::ensure!(
+                        current.goal_id.as_deref() == payload["expectedGoalId"].as_str()
+                            && current.status == pa_core::goals::GoalStatus::Active,
+                        "Owner goal changed"
+                    );
+                    commit()
+                })
+                .await
+        })
+    }
+
+    fn orchestration_permit_is_current(&self, permit: &Value) -> bool {
+        !self.session_is_closed()
+            && !self.gate_budget_or_quota_blocks()
+            && self
+                .children
+                .as_ref()
+                .is_some_and(|children| children.gate_permit_is_current(permit))
+    }
+
+    fn orchestration_gate(
+        &self,
+        configure: Option<Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let children = self
+                .children
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Orchestration children unavailable"))?;
+            match configure {
+                Some(mut payload) => {
+                    if let Some(request) = payload.get("reconcileOwnerCancellation") {
+                        anyhow::ensure!(
+                            payload.as_object().is_some_and(|object| object.len() == 1),
+                            "Unexpected owner reconciliation fields"
+                        );
+                        return children.reconcile_owner_cancellation(request).await;
+                    }
+                    if let Some(request) = payload.get("ownerCancelChild") {
+                        anyhow::ensure!(
+                            payload.as_object().is_some_and(|object| object.len() == 1),
+                            "Unexpected owner cancellation fields"
+                        );
+                        return children.owner_cancel_child(request).await;
+                    }
+                    if let Some(review) = payload.get("beginManagedReview") {
+                        anyhow::ensure!(
+                            crate::child_status_notices::consume(review["nativeNonce"].as_str()),
+                            "Managed review is internal only"
+                        );
+                        anyhow::ensure!(
+                            !self.session_is_closed()
+                                && !self.session_input_queued()
+                                && !self.gate_budget_or_quota_blocks(),
+                            "Managed review stopped by input, close or budget"
+                        );
+                        let goal = self
+                            .current_goal_state()
+                            .ok_or_else(|| anyhow::anyhow!("Goal state unavailable"))?;
+                        children.bind_management_goal(
+                            goal.goal_id
+                                .as_deref()
+                                .ok_or_else(|| anyhow::anyhow!("Goal missing"))?,
+                        )?;
+                        let candidate = children.managed_review_candidate(review).await?;
+                        anyhow::ensure!(
+                            candidate["goalId"].as_str() == goal.goal_id.as_deref(),
+                            "Managed review goal mismatch"
+                        );
+                        let handles = self
+                            .goal_runtime
+                            .lock()
+                            .expect("goal runtime lock")
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Goal runtime missing"))?;
+                        let last_turn = self.last_loop_assistant_message_async().await;
+                        let mut driver = handles.driver.lock().await;
+                        let mut session = handles.session.lock().await;
+                        let minted =
+                            driver.next_continuation_message(&mut session, last_turn.as_ref())?;
+                        anyhow::ensure!(
+                            minted.is_some(),
+                            "Managed review private goal guard refused"
+                        );
+                        if self.session_is_closed() || self.session_input_queued() {
+                            let _ = driver.rollback_continuation_mint(&mut session);
+                            anyhow::bail!(
+                                "Managed review admission cancelled before result consumption"
+                            );
+                        }
+                        if let Err(error) = children.consume_managed_review(&candidate) {
+                            let _ = driver.rollback_continuation_mint(&mut session);
+                            return Err(error);
+                        }
+                        if self.session_is_closed() || self.session_input_queued() {
+                            let _ = driver.rollback_continuation_mint(&mut session);
+                            anyhow::bail!("Managed review admission changed after durable consumption; reconcile without replay");
+                        }
+                        driver.continuation_consumed();
+                        return Ok(json!({"managedReviewPermitted":true,"result":candidate}));
+                    }
+                    if let Some(rebind) = payload.get("rebindNextWorkSource") {
+                        let goal = self.current_goal_state();
+                        return children
+                            .rebind_next_work_source(
+                                rebind,
+                                goal.as_ref().and_then(|goal| goal.goal_id.as_deref()),
+                            )
+                            .await;
+                    }
+                    if let Some(permit) = payload.get("beginWorkStart") {
+                        return children.begin_work_start(permit).await;
+                    }
+                    if payload["invalidateNextWork"] == true {
+                        return children.invalidate_next_work().await;
+                    }
+                    let management_scope = payload
+                        .as_object_mut()
+                        .and_then(|object| object.remove("managementScope"));
+                    let source = payload
+                        .as_object_mut()
+                        .and_then(|object| object.remove("nextWorkSource"));
+                    if let Some(scope) = management_scope.as_ref() {
+                        let goal = self.current_goal_state();
+                        anyhow::ensure!(
+                            (scope["goalId"].is_null()
+                                && goal
+                                    .as_ref()
+                                    .and_then(|goal| goal.goal_id.as_deref())
+                                    .is_none())
+                                || (scope["goalId"].as_str().is_some()
+                                    && scope["goalId"].as_str()
+                                        == goal.as_ref().and_then(|goal| goal.goal_id.as_deref())),
+                            "Invalid management goal"
+                        );
+                    }
+                    let source = source
+                        .as_ref()
+                        .map(crate::rlm_children::next_work::Source::parse)
+                        .transpose()?;
+                    let status = children
+                        .configure_gate_scoped(&payload, management_scope, source)
+                        .await?;
+                    let engine = self
+                        .self_weak
+                        .lock()
+                        .expect("engine self weak lock")
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade);
+                    if let Some(engine) = engine.filter(|_| children.has_management_obligation()) {
+                        engine.retry_owed_autonomous_continuation();
+                    }
+                    Ok(status)
+                }
+                None => Ok(children.gate_status().await),
+            }
+        })
+    }
+
+    /// Withdraw the queued minted goal-context turns so a state change leaves nothing stale to run.
+    fn purge_queued_goal_contexts(&self) {
+        let purge = self
+            .goal_queue_purge
+            .lock()
+            .expect("goal queue purge lock")
+            .clone();
+        if let Some(purge) = purge {
+            purge();
+        }
+    }
+
+    /// The whole-worker idle passivation gate: the settled gates plus an empty RLM
+    /// child registry (rationale on the trait method). The kernel release does NOT
+    /// carry the registry rule: releasing a kernel keeps the worker (and its registry)
+    /// resident.
+    fn can_passivate_worker(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            if !self.settled_passivation_gates_pass().await {
+                return false;
+            }
+            match self.children.clone() {
+                Some(children) => children.child_identities().await.is_empty(),
+                None => true,
+            }
+        })
+    }
+
+    fn release_settled_child_kernel(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if !self.settled_passivation_gates_pass().await {
+                return;
+            }
+            // The release itself: best-effort; a retired runtime releases
+            // nothing. The probe lock drops before the await (`Send`).
+            let release = self
+                .kernel_release_probe
+                .lock()
+                .expect("kernel release probe lock")
+                .clone();
+            if let Some(release) = release {
+                release().await;
+            }
+        })
+    }
+
+    fn goal_state_value(&self) -> Value {
+        if let Some(goal) = self.current_goal_state() {
+            return serde_json::to_value(&goal).unwrap_or(Value::Null);
+        }
+        // The driver is mid-mutation or the session is unbuilt: fall back to the published state,
+        // then empty.
+        let published = self.published_goal.lock().expect("published goal lock");
+        published
+            .as_ref()
+            .and_then(|goal| serde_json::to_value(goal).ok())
+            .or_else(|| serde_json::to_value(pa_core::goals::empty_goal_state()).ok())
+            .unwrap_or(Value::Null)
+    }
+
+    fn edit_goal_objective(
+        &self,
+        goal_id: &str,
+        expected_objective: &str,
+        objective: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<Option<pa_core::goals::GoalState>>>
+                + Send
+                + '_,
+        >,
+    > {
+        let goal_id = goal_id.to_string();
+        let expected_objective = expected_objective.to_string();
+        let objective = objective.to_string();
+        Box::pin(async move {
+            // Create acknowledges before its background prewarm settles. The edit itself
+            // joins that single build gate, without running a model turn.
+            // Mirrored handles exist before adoption restores the durable goal.
+            // Always join the build gate, including that intermediate state.
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            let handles = handles.ok_or_else(|| {
+                anyhow::anyhow!("Cannot edit objective because this thread has no goal.")
+            })?;
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            driver.edit_objective(&mut session, &goal_id, &expected_objective, &objective)
+        })
+    }
+
+    fn mark_goal_edit_published(&self, goal: &pa_core::goals::GoalState) {
+        *self.published_goal.lock().expect("published goal lock") = Some(goal.clone());
+    }
+
+    fn mint_post_compaction_goal_continuation(&self) -> Option<crate::engine::GoalContinuation> {
+        // The mirrored locks are async, so the mint runs on the engine runtime.
+        let handles = self
+            .goal_runtime
+            .lock()
+            .expect("goal runtime lock")
+            .clone()?;
+        // The progress check's input, read before the driver lock. The
+        // failed pair's DROP happens INSIDE the quiescence gate (an early
+        // drop would remint).
+        let last_turn = self.last_loop_assistant_message();
+        let continuation = self.runtime.block_on(async {
+            let mut driver = handles.driver.lock().await;
+            // The quiescence arm: unsettled work defers the mint (owed, not consumed).
+            if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
+                driver.mark_continuation_owed();
+                return None;
+            }
+            // Now the failed pair can leave the loop (`last_turn` still
+            // carries the corpse's verdict).
+            if last_turn
+                .as_ref()
+                .is_some_and(|turn: &pa_agent::types::AssistantMessage| {
+                    turn.stop_reason == pa_agent::types::StopReason::Error
+                        || pa_core::session_engine::goal_driver::turn_produced_no_output(turn)
+                })
+            {
+                drop(driver);
+                self.drop_failed_goal_continuation_pair().await;
+                driver = handles.driver.lock().await;
+            }
+            let mut session = handles.session.lock().await;
+            // The OWED delivery, not a fresh mint: arming then taking keeps
+            // one continuation per owed boundary (an inactive goal or a
+            // failed persist ends the boundary without minting).
+            driver.mark_continuation_owed();
+            let message = match driver.take_owed_continuation(&mut session, last_turn.as_ref()) {
+                Ok(message) => message,
+                Err(error) => {
+                    eprintln!("pa-daemon: goal continuation mint persist failed: {error:#}");
+                    None
+                }
+            };
+            if message.is_none() {
+                // A refused mint still changed the state: publish it and arm the backoff wake.
+                let state = driver.state_with_creation_elapsed();
+                let wake_at = driver.backoff_wake_at();
+                drop(driver);
+                self.publish_goal_state(&state);
+                if let Some(wake_at) = wake_at {
+                    self.schedule_goal_backoff_wake(wake_at).await;
+                }
+                return None;
+            }
+            let message = message?;
+            // This mint's own guard handle: the admission sink releases
+            // exactly it, never the mirror.
+            let pending_handle = Some(driver.pending_continuation_handle());
+            let goal_update = self.publish_goal_state(&driver.state_with_creation_elapsed());
+            drop(driver);
+            self.cancel_goal_backoff_wake();
+            Some((
+                crate::engine::PromptRequest {
+                    batch: Vec::new(),
+                    message: message.content.text(),
+                    images: Vec::new(),
+                    source: "user".to_string(),
+                    agent_message_id: None,
+                    custom_message: Some(crate::session_commands::custom_message_value(&message)),
+                },
+                goal_update,
+                pending_handle,
+            ))
+        })?;
+        let (request, goal_update, pending_handle) = continuation;
+        Some(crate::engine::GoalContinuation {
+            request,
+            goal_update,
+            pending_handle,
+        })
+    }
+
+    fn clear_pending_goal_continuation(&self) {
+        AgentSessionEngine::clear_pending_goal_continuation(self);
+    }
+
+    fn settlement_continuation_pending(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            use std::sync::atomic::Ordering;
+            self.goal_retry_in_flight.load(Ordering::SeqCst) > 0
+                || self.autonomous_retry_in_flight.load(Ordering::SeqCst) > 0
+                || self.autonomous_awaits_rlm_work.load(Ordering::SeqCst)
+                || self
+                    .held_autonomous_continuation
+                    .lock()
+                    .expect("held autonomous continuation lock")
+                    .is_some()
+                || self.headless_goal_wait_state().await
+                    != crate::goal_continuation::HeadlessGoalWait::Settled
+        })
+    }
+
+    fn goal_pending_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        AgentSessionEngine::goal_pending_handle(self)
+    }
+
+    fn release_goal_continuation_handle(
+        &self,
+        handle: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        AgentSessionEngine::release_goal_continuation_handle(handle.as_ref());
+    }
+
+    fn autonomous_status(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<pa_core::autonomous::AgentAutonomousStatus>>
+                + Send
+                + '_,
+        >,
+    > {
+        // The turn loop's accounting holds the state lock across awaits, so
+        // the snapshot takes the async lock.
+        let autonomous = std::sync::Arc::clone(&self.autonomous);
+        Box::pin(async move {
+            let state = autonomous.lock().await;
+            Some(pa_core::autonomous::autonomous_status(&state))
+        })
+    }
+
+    /// Finalize telemetry on the live session: `agent session ended` + one flush; best-effort.
+    fn end_telemetry(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let session = self.session.lock().await;
+            let Some(engine) = session.as_deref() else {
+                return;
+            };
+            let Some(telemetry) = &engine.telemetry else {
+                return;
+            };
+            let _ = telemetry.end().await;
+        })
+    }
+
+    /// The replacement teardown (see
+    /// [`Self::retire_session_runtime`]): the moved-to session rebuilds cold.
+    fn teardown_for_replacement(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.retire_session_runtime().await;
+        })
+    }
+
+    /// The daemon `kill` path: report `session archived`, then finalize
+    /// (`SessionTelemetry::end` is idempotent).
+    fn archive_session_telemetry(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let session = self.session.lock().await;
+            let Some(engine) = session.as_deref() else {
+                return;
+            };
+            let Some(telemetry) = &engine.telemetry else {
+                return;
+            };
+            telemetry.note_archived();
+            let _ = telemetry.end().await;
+        })
+    }
+
+    fn acp_mcp_manager(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>> {
+        Some(std::sync::Arc::clone(&self.mcp))
+    }
+
+    fn model_context_window(&self) -> Option<u64> {
+        self.resolve_model().ok().map(|model| model.context_window)
+    }
+
+    fn creation_model(&self) -> Option<(String, String)> {
+        let model = self.resolve_registry_model().ok()?;
+        Some((model.provider.clone(), model.id))
+    }
+
+    fn set_session_file(&self, path: std::path::PathBuf) {
+        *self
+            .session_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+    }
+
+    fn set_prompt_context_boundary(&self, leaf_id: Option<String>) {
+        let boundary = match leaf_id {
+            Some(leaf) => PromptContextBoundary::Leaf(leaf),
+            None => PromptContextBoundary::Empty,
+        };
+        if std::env::var_os("PA_COMPACTION_TRACE").is_some() {
+            pa_core::session_engine::compaction_trace::trace(
+                "daemon.prompt_boundary",
+                &json!({
+                    "kind": match &boundary {
+                        PromptContextBoundary::Empty => "empty",
+                        PromptContextBoundary::Leaf(_) => "leaf",
+                    },
+                }),
+            );
+        }
+        *self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock") = Some(boundary);
+    }
+
+    /// Restore through the bounded readiness wait. An explicit create flag
+    /// wins; a failed restore is never silent
+    /// ([`Self::model_fallback_message`]).
+    fn restore_session_model(
+        &self,
+        session_path: &std::path::Path,
+        saved: Option<crate::engine::SavedSessionContext>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let path = session_path.to_path_buf();
+        Box::pin(async move {
+            self.restore_session_model_at(&path, saved).await;
+        })
+    }
+
+    /// The non-silent record of a revived session's model falling back.
+    fn model_fallback_message(&self) -> Option<String> {
+        let decision = self
+            .restored_model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let current = self
+            .session_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
+        if decision.session_file != current {
+            return None;
+        }
+        decision.fallback_message
+    }
+
+    /// The `compact` command path: the compact-trigger auto-refine round
+    /// runs after the compaction answered (the same gated body as the
+    /// boundaries).
+    fn consume_compact_auto_refine(
+        &self,
+    ) -> anyhow::Result<Option<pa_core::refinement::RefinementResult>> {
+        self.consume_compact_auto_refine_round()
+    }
+
+    /// The worker's live session summary, rendered into the sender identity block.
+    fn set_session_summary(&self, summary: Value) {
+        *self
+            .own_summary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary.clone());
+        if let Some(children) = &self.children {
+            children.set_parent_session_name(
+                summary
+                    .get("sessionName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+
+    /// The session's newest accepted progress note; `None` before the
+    /// first build and after a run boundary cleared it.
+    fn progress_note(&self) -> Option<String> {
+        self.progress_notes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|notes| notes.latest_note())
+            .map(|(note, _)| note)
+    }
+
+    /// Clears the stored note at the run boundary; the throttle clock stays.
+    fn clear_progress_note(&self) {
+        if let Some(notes) = self
+            .progress_notes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            notes.clear();
+        }
+    }
+
+    fn configure_service_tier(&self, tier: Option<pa_types::ai::ServiceTier>) {
+        *self.service_tier.write().expect("service tier lock") = tier;
+        if let Some(target) = self
+            .provider_target
+            .write()
+            .expect("provider target lock")
+            .as_mut()
+        {
+            target.service_tier = tier;
+        }
+    }
+
+    fn configure_model(&self, selection: EngineModelSelection) {
+        // Merge like the TS runtime config: explicit wire flags replace; absent fields keep.
+        {
+            let mut current = self.selection.write().expect("model selection lock");
+            if selection.provider.is_some() {
+                current.provider = selection.provider;
+            }
+            if selection.model.is_some() {
+                current.model = selection.model;
+            }
+            if selection.api_key.is_some() {
+                current.api_key = selection.api_key;
+            }
+            if selection.thinking.is_some() {
+                current.thinking = selection.thinking;
+            }
+        }
+        // The merge may have changed the selection: drop the cached level;
+        // later summary/state calls stay side-effect-free.
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = None;
+        let _ = self.effective_thinking();
+    }
+
+    fn configure_create_model(&self, selection: EngineModelSelection) {
+        // The create's explicit flags fold into the runtime config (TS
+        // `mergeAgentSessionRuntimeConfig`) and must survive the restore reset.
+        {
+            let mut initial = self
+                .initial_selection
+                .write()
+                .expect("initial selection lock");
+            if selection.provider.is_some() {
+                initial.provider.clone_from(&selection.provider);
+            }
+            if selection.model.is_some() {
+                initial.model.clone_from(&selection.model);
+            }
+            if selection.api_key.is_some() {
+                initial.api_key.clone_from(&selection.api_key);
+            }
+            if selection.thinking.is_some() {
+                initial.thinking = selection.thinking;
+            }
+        }
+        self.configure_model(selection);
+    }
+
+    fn switch_model(&self, selection: EngineModelSelection) -> bool {
+        if let (Some(provider), Some(model)) =
+            (selection.provider.as_deref(), selection.model.as_deref())
+        {
+            let selector = format!("{provider}/{model}");
+            let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
+            if crate::model_allowlist::assert_allowed(&allowlist, &selector).is_err() {
+                return false;
+            }
+        }
+        self.configure_model(selection);
+        let Ok(model) = self.resolve_model() else {
+            return false;
+        };
+        {
+            // The switch's resolve-and-install serializes with `/reload`'s
+            // live-input refresh (the failover callbacks' fence): a reload
+            // landing between this resolution and the slot write must not
+            // be clobbered by the switch's older pair.
+            let _reload_serialized = self
+                .reload_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (api_key, headers) = self.resolve_request_key_and_headers(&model);
+            let mut target = self.provider_target.write().expect("provider target lock");
+            *target = Some(ProviderTarget {
+                service_tier: *self.service_tier.read().expect("service tier lock"),
+                api_key,
+                model: model.clone(),
+                headers,
+            });
+        }
+        let session = self.session.blocking_lock();
+        if let Some(core) = session.as_deref() {
+            let provider = model.provider.clone();
+            let model_id = model.id.clone();
+            // ONE agent-lock acquisition updates model and level together
+            // (a mid-switch turn never sees a mismatch). No durable
+            // `thinking_level_change` row — `/thinking` owns it.
+            let level = map_thinking_level(self.effective_thinking());
+            let _ = self.runtime.block_on(
+                core.session
+                    .set_model_and_thinking_level(&model, &provider, &model_id, level),
+            );
+            // The turn-boundary model facts follow the switch: `model.info`
+            // and the usage estimate's context window report the model now
+            // running. A core that is not built yet rebinds at its build.
+            core.update_model_facts(&model);
+        }
+        if let Some(children) = &self.children {
+            children.set_model(format!("{}/{}", model.provider, model.id));
+        }
+        true
+    }
+
+    fn supported_thinking_levels(&self) -> Option<Vec<String>> {
+        let model = self.resolve_model().ok()?;
+        Some(
+            pa_ai::models::get_supported_thinking_levels(&model)
+                .into_iter()
+                .map(|level| level.wire_name().to_string())
+                .collect(),
+        )
+    }
+
+    fn switch_thinking_level(&self, level: pa_types::ai::ModelThinkingLevel) -> bool {
+        self.configure_model(EngineModelSelection {
+            thinking: Some(level),
+            ..Default::default()
+        });
+        // The effective level is the request clamped to the model's support;
+        // the agent follows next turn.
+        let effective = self.effective_thinking();
+        let session = self.session.blocking_lock();
+        if let Some(core) = session.as_deref() {
+            let _ = self.runtime.block_on(
+                core.session
+                    .set_thinking_level(map_thinking_level(effective)),
+            );
+        }
+        true
+    }
+
+    fn effective_thinking_level(&self) -> Option<String> {
+        Some(self.effective_thinking().wire_name().to_string())
+    }
+
+    /// The built session's assembled prompt (the export embeds it); best-effort.
+    fn export_system_prompt(&self) -> Option<String> {
+        let session = self.session.try_lock().ok()?;
+        session.as_deref().map(|core| core.system_prompt.clone())
+    }
+
+    /// The built session's live tool registry mapped to the export's tools
+    /// section (TS `state.tools`).
+    fn export_tools(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<Value>>> + Send + '_>> {
+        Box::pin(async move {
+            let model = self.resolve_model().ok()?;
+            self.ensure_core_session_async(&model).await.ok()?;
+            let session = self.session.try_lock().ok()?;
+            let state = session.as_deref()?.session.agent().state().await;
+            Some(pa_core::export_html::tools_section(&state.tools))
+        })
+    }
+
+    /// The export's custom-tool pre-render, against the same registry as [`Self::export_tools`].
+    fn export_rendered_tools(
+        &self,
+        entries: &[Value],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + '_>> {
+        let entries = entries.to_vec();
+        Box::pin(async move {
+            let model = self.resolve_model().ok()?;
+            self.ensure_core_session_async(&model).await.ok()?;
+            let session = self.session.try_lock().ok()?;
+            let state = session.as_deref()?.session.agent().state().await;
+            let renderer = crate::session_export::ExportToolRenderer {
+                tools: &state.tools,
+            };
+            pa_core::export_html::pre_render_custom_tools(&entries, &renderer)
+        })
+    }
+
+    fn configure_startup_scope(
+        &self,
+        scoped_models: Vec<pa_core::models::ScopedModel>,
+        patterns: Vec<String>,
+        is_continuing: bool,
+    ) {
+        *self.startup_scope.lock().unwrap() = Some(StartupScope {
+            scoped_models,
+            patterns,
+            is_continuing,
+        });
+        // The scope changed the startup decisions: drop the stale level; the
+        // next read re-resolves against the scope.
+        *self
+            .effective_thinking
+            .write()
+            .expect("effective thinking lock") = None;
+    }
+
+    fn model_identity(&self) -> (Option<String>, Option<String>) {
+        let selection = self.current_selection();
+        (selection.provider, selection.model)
+    }
+
+    fn model_metadata(&self) -> Option<Value> {
+        let model = self.resolve_model().ok()?;
+        Some(json!({
+            "id": model.id,
+            "name": model.name,
+            "api": model.api,
+            "provider": model.provider,
+            "reasoning": model.reasoning,
+        }))
+    }
+
+    fn control_goal(
+        &self,
+        goal_id: &str,
+        expected_objective: &str,
+        action: pa_core::session_engine::goal_driver::GoalControlAction,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<Option<pa_core::goals::GoalState>>>
+                + Send
+                + '_,
+        >,
+    > {
+        let goal_id = goal_id.to_string();
+        let expected_objective = expected_objective.to_string();
+        Box::pin(async move {
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            let handles = handles.ok_or_else(|| {
+                anyhow::anyhow!("Cannot control goal because this thread has no goal.")
+            })?;
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            driver.control_goal(&mut session, &goal_id, &expected_objective, action)
+        })
+    }
+
+    fn atomic_goal_stop<'a>(
+        &'a self,
+        goal_id: &'a str,
+        expected_objective: &'a str,
+        action: pa_core::session_engine::goal_driver::GoalControlAction,
+        commit: &'a mut (dyn FnMut(&pa_core::goals::GoalState) -> anyhow::Result<()> + Send),
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<pa_core::goals::GoalState>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let handles = self
+                .goal_runtime
+                .lock()
+                .expect("goal runtime lock")
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Goal session is not built"))?;
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            let changed = driver.control_goal(&mut session, goal_id, expected_objective, action)?;
+            let goal = changed.unwrap_or_else(pa_core::goals::empty_goal_state);
+            // Driver/session remain locked until durable worker append and exact-turn cancellation.
+            commit(&goal).map_err(|error| anyhow::anyhow!("UNKNOWN: goal changed in memory; worker commit/cancellation unconfirmed: {error:#}"))?;
+            Ok(goal)
+        })
+    }
+
+    fn session_model_identity(&self) -> (Option<String>, Option<String>) {
+        match self.session_model() {
+            Ok(model) => (Some(model.provider), Some(model.id)),
+            Err(_) => (None, None),
+        }
+    }
+
+    fn is_quota_parked(&self) -> bool {
+        AgentSessionEngine::is_quota_parked(self)
+    }
+
+    fn has_background_bash(&self) -> bool {
+        self.has_live_background_bash_handles()
+    }
+
+    fn has_running_subagents(&self) -> bool {
+        self.children
+            .as_ref()
+            .is_some_and(|children| children.has_running_children())
+    }
+
+    /// `compact` over the hosted pa-core session: the session summarizes
+    /// its own branch, persists the entry on its in-memory store, and
+    /// rebuilds the loop context; the worker persists the durable entry.
+    /// The abort races the run: the summarizer call is cancelled by
+    /// dropping the future (the entry write happens inside it).
+    fn abort_auto_compaction(&self) {
+        // Aborts the controller in flight; only its own controller clears the slot.
+        let controller = self
+            .auto_compaction_abort
+            .lock()
+            .expect("auto compaction abort lock")
+            .clone();
+        if let Some(controller) = controller {
+            controller.abort();
+        }
+    }
+
+    fn run_compaction(
+        &self,
+        request: CompactionRequest,
+        signal: &pa_agent::abort::AbortSignal,
+    ) -> CompactionOutcome {
+        let model = match self.session_model() {
+            Ok(model) => model,
+            Err(error) => {
+                return CompactionOutcome::Failed {
+                    error: error.to_string(),
+                }
+            }
+        };
+        if let Err(error) = self.session_agent(&model) {
+            return CompactionOutcome::Failed {
+                error: error.to_string(),
+            };
+        }
+        let custom_instructions = request.custom_instructions;
+        // The live target's key: the config key is the startup snapshot and
+        // goes stale with provider switches.
+        let api_key = self.resolve_request_api_key(&model);
+        let run = async {
+            // The lock covers the clone only; the summarizer call below must not ride it.
+            let session = self.session.lock().await.clone();
+            let Some(engine) = session else {
+                anyhow::bail!("session not built");
+            };
+            engine
+                .session
+                .compact(
+                    custom_instructions.as_deref(),
+                    &model,
+                    api_key,
+                    // The run's own signal: a raced summarizer still lands
+                    // the pre-commit check (TS `_performCompaction`).
+                    Some(signal),
+                )
+                .await
+        };
+        let result = self
+            .runtime
+            .block_on(pa_agent::abort::race_with_abort(run, signal));
+        let compaction = match result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                // Abort-marked errors and a lost race both surface as the
+                // TS "Compaction cancelled" outcome.
+                if pa_agent::abort::is_abort_error(&error) {
+                    return CompactionOutcome::Aborted;
+                }
+                return CompactionOutcome::Failed {
+                    error: format!("{error:#}"),
+                };
+            }
+            Err(_) => return CompactionOutcome::Aborted,
+        };
+        match compaction {
+            pa_core::session_engine::compact_session::CompactOutcome::Skipped(message) => {
+                CompactionOutcome::Skipped {
+                    message: message.to_string(),
+                }
+            }
+            pa_core::session_engine::compact_session::CompactOutcome::Ran(run) => {
+                {
+                    let guard = self.session.blocking_lock();
+                    if let Some(telemetry) = guard
+                        .as_deref()
+                        .and_then(|engine| engine.telemetry.as_ref())
+                    {
+                        telemetry.note_compaction(Some(run.duration_ms));
+                    }
+                }
+                // The compact-trigger auto-refine review runs after every successful compaction.
+                self.mark_compact_auto_refine_pending();
+                CompactionOutcome::Compacted {
+                    run: Box::new(CompactionRun {
+                        // The wire result is the TS `CompactionResult` shape;
+                        // usage and the digest snapshot live on the entry.
+                        result: crate::compaction::compaction_result_value(&run.result, &run.entry),
+                        usage: run
+                            .result
+                            .usage
+                            .and_then(|usage| serde_json::to_value(usage).ok()),
+                        entry: serde_json::to_value(&run.entry).unwrap_or(Value::Null),
+                        ipython_state: run
+                            .ipython_state
+                            .as_ref()
+                            .map(crate::session_commands::custom_message_value),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn run_branch_summary(
+        &self,
+        request: BranchSummaryRequest,
+        signal: &pa_agent::abort::AbortSignal,
+    ) -> BranchSummaryOutcome {
+        let model = match self.session_model() {
+            Ok(model) => model,
+            Err(error) => {
+                return BranchSummaryOutcome::Failed {
+                    error: error.to_string(),
+                }
+            }
+        };
+        let api_key = self.resolve_request_api_key(&model);
+        let settings =
+            pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
+        let reserve_tokens = settings
+            .settings()
+            .branch_summary
+            .as_ref()
+            .and_then(|branch_summary| branch_summary.reserve_tokens)
+            .unwrap_or(
+                pa_core::session_engine::branch_summarization::DEFAULT_BRANCH_RESERVE_TOKENS,
+            );
+        let entries = request.entries;
+        let custom_instructions = request.custom_instructions;
+        let replace_instructions = request.replace_instructions;
+        let session_id = request.session_id;
+        // TS #2411: the branch summary resolves its model through the
+        // `auxiliaryModel` setting, keeping its one-off prompt off the
+        // prompt-cache prefix.
+        let auxiliary = pa_core::session_engine::auxiliary_model::AuxiliaryModelContext {
+            cwd: self.cwd(),
+            agent_dir: self.config.agent_dir.clone(),
+        };
+        let run = async {
+            pa_core::session_engine::branch_summarization::generate_branch_summary(
+                &entries,
+                pa_core::session_engine::branch_summarization::GenerateBranchSummaryOptions {
+                    model: &model,
+                    api_key,
+                    custom_instructions: custom_instructions.as_deref(),
+                    replace_instructions,
+                    reserve_tokens,
+                    auxiliary: Some(&auxiliary),
+                    session_id: Some(&session_id),
+                },
+            )
+            .await
+        };
+        match self
+            .runtime
+            .block_on(pa_agent::abort::race_with_abort(run, signal))
+        {
+            Ok(result) => {
+                if result.aborted {
+                    return BranchSummaryOutcome::Aborted;
+                }
+                if let Some(error) = result.error {
+                    return BranchSummaryOutcome::Failed { error };
+                }
+                let summary = result
+                    .summary
+                    .unwrap_or_else(|| "No summary generated".to_string());
+                BranchSummaryOutcome::Complete {
+                    run: BranchSummaryRun {
+                        summary,
+                        usage: result
+                            .usage
+                            .and_then(|usage| serde_json::to_value(usage).ok()),
+                        details: Some(json!({
+                            "readFiles": result.read_files,
+                            "modifiedFiles": result.modified_files,
+                        })),
+                        model: result.model,
+                    },
+                }
+            }
+            Err(_) => BranchSummaryOutcome::Aborted,
+        }
+    }
+
+    fn rebuild_session_context(
+        &self,
+        branch_entries: Vec<pa_types::session::FileEntry>,
+        goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
+    ) -> anyhow::Result<()> {
+        // The caller parks this call on a blocking thread, so `blocking_lock` is legal here.
+        let built = self.session.blocking_lock().is_some();
+        if !built {
+            // The session builds lazily; park the branch so the build consumes it.
+            *self
+                .pending_branch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(branch_entries);
+            return Ok(());
+        }
+        self.runtime.block_on(async move {
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_deref() else {
+                return Ok(());
+            };
+            // The moved branch invalidates an armed review.
+            engine.session.discard_compact_auto_refine();
+            engine
+                .session
+                .rebuild_branch_context(branch_entries)
+                .await?;
+            // The rebuilt context reads the moved branch's own latest goal
+            // entry; the announcement publishes while the driver lock is held.
+            let mut driver = engine.goal_driver.lock().await;
+            let session = engine.session.shared_persistence();
+            let manager = session.lock().await;
+            driver.reload_from_branch(&manager, goal_reload);
+            let announcement = self.publish_goal_state(&driver.state_with_creation_elapsed());
+            *self
+                .reloaded_goal_update
+                .lock()
+                .expect("reloaded goal update lock") = announcement;
+            Ok(())
+        })
+    }
+
+    fn goal_update_after_rebuild(&self) -> Option<Value> {
+        // The on-change announcement: already published through the dedupe; taken exactly once.
+        self.reloaded_goal_update
+            .lock()
+            .expect("reloaded goal update lock")
+            .take()
+    }
+
+    /// Rebind the session cwd: the rebuilt session's kernel-resident tools
+    /// run in the moved-to cwd; the default driver follows, an injected
+    /// driver stays.
+    fn set_cwd(&self, cwd: std::path::PathBuf) {
+        {
+            let mut slot = self.cwd.write().expect("engine cwd lock");
+            if *slot == cwd {
+                return;
+            }
+            (*slot).clone_from(&cwd);
+        }
+        if self
+            .autonomous_driver_default
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            *self
+                .autonomous_driver
+                .write()
+                .expect("autonomous driver lock") =
+                std::sync::Arc::new(pa_core::autonomous::ShellAutonomousDriver::new(cwd))
+                    as std::sync::Arc<dyn pa_core::autonomous::AutonomousDriver>;
+        }
+    }
+
+    fn configure_rlm_identity(
+        &self,
+        identity: crate::engine::RlmSessionIdentity,
+    ) -> anyhow::Result<()> {
+        // This session's own depth gates the kernel `refine.*` host requests (depth-0 only).
+        self.rlm_depth
+            .store(identity.rlm_depth, std::sync::atomic::Ordering::Relaxed);
+        self.factory_child
+            .store(identity.factory_child, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thinking) = &identity.thinking {
+            pa_ai::models::thinking_level_from_str(thinking)
+                .ok_or_else(|| anyhow::anyhow!("unknown thinking level \"{thinking}\""))?;
+        }
+        // The depth bound's precedence: chat override > inherited > global
+        // setting > env > default (the shared resolver).
+        let (max_depth, source) = pa_core::session_engine::rlm_host::resolve_rlm_max_depth(
+            identity.session_file.as_deref(),
+            identity.rlm_max_depth,
+            &self.cwd(),
+            &self.config.agent_dir,
+        );
+        *self.rlm_max_depth_source.lock().expect("depth source lock") = source;
+        // The semantic-edge identity (TS `semanticEdgeLedgerPath` +
+        // provenance): a spawned child's ledger lives in its rlm session
+        // dir (the session file's parent), a top-level session's in its
+        // artifact dir; the durable session id is the ledger identity
+        // (the in-memory engine manager's id is per-build). A session
+        // without a durable id records nothing.
+        let semantic_identity = identity.session_id.clone().map(|session_id| {
+            let rlm_session_dir = match &identity.semantic_spawn {
+                Some(_) => identity
+                    .session_file
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .and_then(std::path::Path::parent),
+                None => None,
+            };
+            let artifact_dir = identity
+                .session_file
+                .as_deref()
+                .map(std::path::Path::new)
+                .and_then(pa_core::session_engine::harness_digest::session_artifact_dir_for_log);
+            pa_core::session_engine::semantic_edges::SemanticEdgeIdentity {
+                session_id,
+                ledger_path: pa_core::session_engine::semantic_edges::semantic_edge_ledger_path(
+                    rlm_session_dir,
+                    artifact_dir.as_deref(),
+                ),
+                parent_session_id: identity
+                    .semantic_spawn
+                    .as_ref()
+                    .and_then(|spawn| spawn.parent_session_id.clone()),
+                spawned_by_request_id: identity
+                    .semantic_spawn
+                    .as_ref()
+                    .and_then(|spawn| spawn.spawned_by_request_id.clone()),
+            }
+        });
+        *self
+            .semantic_identity
+            .lock()
+            .expect("semantic identity lock") = semantic_identity;
+        if let Some(children) = &self.children {
+            let parent = ParentIdentity {
+                rlm_depth: identity.rlm_depth,
+                rlm_max_depth: max_depth.min(u64::from(u32::MAX)) as u32,
+                model: None,
+                cwd: identity.cwd.clone(),
+                session_id: identity.session_id.clone(),
+                session_file: identity.session_file.clone(),
+                thinking: identity.thinking.clone(),
+                child_script: identity.child_script,
+            };
+            children.set_identity(parent);
+        }
+        Ok(())
+    }
+
+    /// An agent message from one of this session's children arrived: the
+    /// registry records it so the child's no-reply notice is withheld.
+    fn mark_child_reply(&self, child_active_session_id: &str) {
+        if let Some(children) = &self.children {
+            let children = Arc::clone(children);
+            let child = child_active_session_id.to_string();
+            self.runtime.spawn(async move {
+                children.mark_replied(&child).await;
+            });
+        }
+    }
+
+    fn on_turn_start(&self) {
+        if let Some(children) = &self.children {
+            children.notify_turn_started();
+        }
+    }
+
+    /// The worker's turn completed: release child prompt tasks waiting on the boundary.
+    fn on_turn_done(&self) {
+        *self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock") = None;
+        self.runtime.block_on(async {
+            let core = self.session.lock().await.clone();
+            if let Some(core) = core {
+                core.session
+                    .shared_persistence()
+                    .lock()
+                    .await
+                    .replay_admitted_user_rows(Vec::new())
+                    .expect("clearing admitted rows cannot fail");
+            }
+        });
+        if let Some(children) = &self.children {
+            children.notify_turn_done();
+        }
+    }
+
+    fn run_side_question(
+        &self,
+        request: SideQuestionRequest,
+        signal: &pa_agent::abort::AbortSignal,
+        sink: &pa_core::session_engine::side_question::SideQuestionSink,
+    ) -> SideQuestionOutcome {
+        let model = match self.session_model() {
+            Ok(model) => model,
+            Err(error) => {
+                return SideQuestionOutcome::Failed {
+                    answer: String::new(),
+                    error: error.to_string(),
+                }
+            }
+        };
+        let agent = match self.session_agent(&model) {
+            Ok(agent) => agent,
+            Err(error) => {
+                return SideQuestionOutcome::Failed {
+                    answer: String::new(),
+                    error: error.to_string(),
+                }
+            }
+        };
+        let question = request.question.clone();
+        let previous_turns = request.previous_turns;
+        let retry_policy = pa_core::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY;
+        // TS `unwrapSemanticEdgeStreamFn`: the side call runs on the
+        // session's pre-semantic stream fn, so it carries no request id
+        // and the ledger records nothing. The engine build always wires
+        // it; no fallback to the agent's own fn, which would leak the
+        // id-carrying wrapper into the side call.
+        let side_stream_fn = {
+            let guard = self.session.blocking_lock();
+            guard
+                .as_deref()
+                .and_then(|engine| engine.session.side_question_stream_fn())
+        };
+        let Some(side_stream_fn) = side_stream_fn else {
+            return SideQuestionOutcome::Failed {
+                answer: String::new(),
+                error: "Select a model before asking a side question".to_string(),
+            };
+        };
+        let result =
+            self.runtime
+                .block_on(pa_core::session_engine::side_question::run_side_question(
+                    &agent,
+                    side_stream_fn,
+                    &question,
+                    &previous_turns,
+                    &retry_policy,
+                    signal,
+                    sink,
+                ));
+        match result.status {
+            pa_core::session_engine::side_question::SideQuestionStatus::Complete => {
+                SideQuestionOutcome::Complete {
+                    answer: result.answer,
+                }
+            }
+            pa_core::session_engine::side_question::SideQuestionStatus::Cancelled => {
+                SideQuestionOutcome::Aborted {
+                    answer: result.answer,
+                }
+            }
+            pa_core::session_engine::side_question::SideQuestionStatus::Error => {
+                SideQuestionOutcome::Failed {
+                    answer: result.answer,
+                    error: result
+                        .error_message
+                        .unwrap_or_else(|| "Side question failed".to_string()),
+                }
+            }
+        }
+    }
+
+    fn rlm_child_snapshots(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        let children = self.children.clone();
+        Box::pin(async move {
+            let Some(children) = children else {
+                return Vec::new();
+            };
+            children.child_snapshots().await
+        })
+    }
+
+    fn connection_commands(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(async move {
+            // This port builds the core session lazily; a read before any turn builds it now.
+            if let Ok(model) = self.resolve_model() {
+                if let Err(error) = self.ensure_core_session_async(&model).await {
+                    eprintln!("get_commands session build failed: {error:#}");
+                    return Vec::new();
+                }
+            }
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_deref() else {
+                return Vec::new();
+            };
+            // Order: prompt templates, then skills.
+            let mut commands = Vec::new();
+            for template in &engine.prompt_templates {
+                let mut entry = json!({
+                    "name": template.name,
+                    "source": "prompt",
+                    "sourceInfo": template.source_info,
+                });
+                if let Some(hint) = &template.argument_hint {
+                    entry["argumentHint"] = json!(hint);
+                }
+                if !template.description.is_empty() {
+                    entry["description"] = json!(template.description);
+                }
+                commands.push(entry);
+            }
+            for skill in &engine.skills {
+                let mut entry = json!({
+                    "name": format!("skill:{}", skill.name),
+                    "source": "skill",
+                    "sourceInfo": skill.source_info,
+                });
+                if !skill.description.is_empty() {
+                    entry["description"] = json!(skill.description);
+                }
+                commands.push(entry);
+            }
+            commands
+        })
+    }
+
+    fn resource_snapshot(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + '_>> {
+        Box::pin(async move {
+            let session_id = {
+                let guard = self.session.lock().await;
+                match guard.as_deref() {
+                    Some(engine) => engine.session.session_id().await,
+                    None => {
+                        return crate::engine::empty_resource_snapshot();
+                    }
+                }
+            };
+            let guard = self.session.lock().await;
+            let Some(engine) = guard.as_deref() else {
+                return crate::engine::empty_resource_snapshot();
+            };
+            let cwd = self.cwd().display().to_string();
+            let mut skills = Vec::new();
+            for skill in &engine.skills {
+                let mut entry = json!({
+                    "name": skill.name,
+                    "filePath": skill.file_path.display().to_string(),
+                    "sourceInfo": skill.source_info,
+                });
+                if !skill.description.is_empty() {
+                    entry["description"] = json!(skill.description);
+                }
+                if let Some(artifact) = artifact_reference(
+                    &session_id,
+                    &cwd,
+                    "skill",
+                    &skill.file_path.display().to_string(),
+                ) {
+                    entry["artifact"] = artifact;
+                }
+                skills.push(entry);
+            }
+            let mut prompts = Vec::new();
+            for template in &engine.prompt_templates {
+                let mut entry = json!({
+                    "name": template.name,
+                    "filePath": template.file_path,
+                    "sourceInfo": template.source_info,
+                });
+                if !template.description.is_empty() {
+                    entry["description"] = json!(template.description);
+                }
+                if let Some(hint) = &template.argument_hint {
+                    entry["argumentHint"] = json!(hint);
+                }
+                if let Some(artifact) =
+                    artifact_reference(&session_id, &cwd, "prompt", &template.file_path)
+                {
+                    entry["artifact"] = artifact;
+                }
+                prompts.push(entry);
+            }
+            let mut context_files = Vec::new();
+            for file in &engine.agents_files {
+                let mut entry = json!({ "path": file.path.display().to_string() });
+                if let Some(artifact) = artifact_reference(
+                    &session_id,
+                    &cwd,
+                    "context_file",
+                    &file.path.display().to_string(),
+                ) {
+                    entry["artifact"] = artifact;
+                }
+                context_files.push(entry);
+            }
+            json!({
+                "contextFiles": context_files,
+                "skills": skills,
+                "prompts": prompts,
+                "themes": [],
+                "diagnostics": {
+                    "skills": engine.skill_diagnostics,
+                    "prompts": [],
+                    "themes": [],
+                },
+            })
+        })
+    }
+
+    fn system_prompt(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>>
+    {
+        Box::pin(async move {
+            // The core session builds lazily; a prompt read before any turn
+            // builds it on the async path (the caller's runtime).
+            let model = self.resolve_model()?;
+            self.ensure_core_session_async(&model).await?;
+            let guard = self.session.lock().await;
+            let engine = guard.as_deref().expect("session built above");
+            Ok(engine.system_prompt.clone())
+        })
+    }
+
+    fn tool_definition(
+        &self,
+        name: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let guard = self.session.lock().await;
+            let engine = guard.as_deref()?;
+            let state = engine.session.agent().state().await;
+            let tool = state.tools.iter().find(|tool| tool.name() == name)?;
+            Some(json!({
+                "name": tool.name(),
+                "label": tool.label(),
+                "description": tool.description(),
+                "parameters": tool.parameters(),
+            }))
+        })
+    }
+
+    fn run_refinement(
+        &self,
+        options: pa_core::session_engine::refine::RefineOptions,
+    ) -> anyhow::Result<Value> {
+        let model = self.resolve_model()?;
+        self.ensure_core_session(&model)?;
+        let api_key = self.resolve_request_api_key(&model);
+        let global_harness_dir = self.config.agent_dir.clone();
+        // The lock covers the clone only; the model call below must not ride it.
+        let core = self
+            .session
+            .blocking_lock()
+            .clone()
+            .expect("session built by ensure_core_session");
+        let result = self.runtime.block_on(async {
+            core.session
+                .refine(
+                    &options,
+                    pa_core::session_engine::refine::RefinementSource::User,
+                    &model,
+                    api_key,
+                    global_harness_dir,
+                )
+                .await
+        })?;
+        serde_json::to_value(&result)
+            .map_err(|error| anyhow::anyhow!("refinement result conversion failed: {error}"))
+    }
+
+    fn rlm_max_depth_status(&self) -> Value {
+        let source = *self.rlm_max_depth_source.lock().expect("depth source lock");
+        let max_depth = match &self.children {
+            Some(children) => children.rlm_max_depth(),
+            None => DEFAULT_RLM_MAX_DEPTH,
+        };
+        json!({ "maxDepth": max_depth, "source": source })
+    }
+
+    fn cancel_rlm_child<'a>(
+        &'a self,
+        child_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            match &self.children {
+                Some(children) => children.cancel_child_run(child_id).await,
+                None => false,
+            }
+        })
+    }
+
+    fn delete_rlm_subagent<'a>(
+        &'a self,
+        child_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<&'static str>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match &self.children {
+                Some(children) => children.delete_inactive_subagent(child_id).await,
+                None => Ok("not_found"),
+            }
+        })
+    }
+
+    fn set_rlm_max_depth(&self, max_depth: u64, global: bool) -> anyhow::Result<Value> {
+        if let Some(children) = &self.children {
+            children.set_rlm_max_depth(max_depth.min(u64::from(u32::MAX)) as u32);
+        }
+        *self.rlm_max_depth_source.lock().expect("depth source lock") = "chat";
+        // The durable `rlm_max_depth_state` entry: a resumed session
+        // re-seeds from it; an unbuilt session parks it (the
+        // `pending_branch` pattern).
+        self.persist_max_depth_state(max_depth);
+        // The global settings write: errors join the `globalError` field,
+        // they do not fail the command.
+        let mut result = json!({
+            "maxDepth": max_depth,
+            "source": "chat",
+            "globalSaved": false,
+        });
+        if global {
+            if let Some(error) = self.write_global_rlm_max_depth(max_depth) {
+                result["globalError"] = json!(error);
+            } else {
+                result["globalSaved"] = json!(true);
+            }
+        }
+        Ok(result)
+    }
+
+    fn run_prompt(
+        &self,
+        _prompt_index: usize,
+        mut request: PromptRequest,
+        aborted: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) {
+        if request.custom_message.as_ref().is_some_and(|row| {
+            row["customType"] == crate::engine::ORCHESTRATION_CONTROL_TYPE
+                && !self.orchestration_permit_is_current(&row["details"])
+        }) {
+            emit(EngineEvent::Done(Ok(())));
+            return;
+        }
+        let mut emit = self.goal_tracking_emit(emit);
+        // The accepted-turn row carries the skill-expanded text (the
+        // transcript renders the skill card).
+        if request.message.starts_with("/skill:") {
+            request.message = self.expand_skill_submission(&request.message);
+        }
+        // The batched rows expand in place BEFORE the accepted rows emit:
+        // the core's batch admission re-expands each row itself, so the raw
+        // command must never reach it.
+        for row in &mut request.batch {
+            if row.text.starts_with("/skill:") {
+                row.text = self.expand_skill_submission(&row.text);
+            }
+        }
+        // Session commands never admit a model turn or record a user row
+        // (the durable echo row replaces it). Execute before admission so
+        // the idle-wait loop stays reachable only for real turns.
+        if let Some(command) =
+            crate::session_commands::parse_prompt_session_command(&request.message)
+        {
+            let Some(execution) = crate::session_commands::run_session_command(
+                self,
+                &command,
+                &request.images,
+                &mut emit,
+            ) else {
+                return;
+            };
+            if let Some(error) = &execution.error {
+                emit(EngineEvent::Done(Err(error.clone())));
+                return;
+            }
+            // A goal start/resume schedules its continuation context as the
+            // turn (an injected custom row): the durable pair precedes the
+            // turn it drives — one representation (unchanged `/goal` stays
+            // silent).
+            if let Some(message) = execution.continuation_message {
+                if !emit(EngineEvent::CustomMessage(
+                    crate::session_commands::custom_message_value(&message),
+                )) {
+                    return;
+                }
+                self.run_turns(TurnPrompt::Injected(message), aborted, &mut emit);
+            } else {
+                emit(EngineEvent::Done(Ok(())));
+            }
+            return;
+        }
+        // The injected custom row parses to its session shape first: an
+        // unparseable row fails the turn, not double-represents it.
+        let injected = match &request.custom_message {
+            Some(custom) => {
+                match serde_json::from_value::<pa_types::session::AgentMessage>(custom.clone()) {
+                    Ok(pa_types::session::AgentMessage::Custom(parsed)) => Some(parsed),
+                    Ok(_) => {
+                        emit(EngineEvent::Done(Err(
+                            "injected custom message must carry role \"custom\"".to_string(),
+                        )));
+                        return;
+                    }
+                    Err(error) => {
+                        emit(EngineEvent::Done(Err(format!(
+                            "injected custom message parse failed: {error}"
+                        ))));
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
+        // The accepted turn row: an injected custom row replaces the user
+        // message; the plain turn records the accepted row, images after.
+        let accepted = if let Some(custom) = &request.custom_message {
+            EngineEvent::CustomMessage(custom.clone())
+        } else {
+            let mut content = vec![json!({ "type": "text", "text": request.message })];
+            for image in &request.images {
+                let mut block = match serde_json::to_value(image) {
+                    Ok(Value::Object(block)) => Value::Object(block),
+                    _ => continue,
+                };
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("type".to_string(), json!("image"));
+                }
+                content.push(block);
+            }
+            EngineEvent::UserMessage(json!({
+                "role": "user",
+                "content": content,
+                "timestamp": now_millis(),
+            }))
+        };
+        if !emit(accepted) {
+            return;
+        }
+        // The batched co-delivery rows: one accepted user row per batched
+        // message, in delivery order, already expanded above.
+        for row in &request.batch {
+            let text = row.text.clone();
+            let mut content = vec![json!({ "type": "text", "text": text })];
+            for image in &row.images {
+                let mut block = match serde_json::to_value(image) {
+                    Ok(Value::Object(block)) => Value::Object(block),
+                    _ => continue,
+                };
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("type".to_string(), json!("image"));
+                }
+                content.push(block);
+            }
+            if !emit(EngineEvent::UserMessage(json!({
+                "role": "user",
+                "content": content,
+                "timestamp": now_millis(),
+            }))) {
+                return;
+            }
+        }
+        let turn_prompt = match injected {
+            Some(custom) => TurnPrompt::Injected(custom),
+            None => TurnPrompt::User {
+                text: request.message.clone(),
+                images: request.images.clone(),
+                batch: request.batch,
+            },
+        };
+        // A batch with image blocks routes to `settings.imageModel` when the
+        // session model cannot serve them, or the turn fails with the
+        // actionable refusal naming the setting.
+        let carries_images = match &turn_prompt {
+            TurnPrompt::User { images, batch, .. } => {
+                !images.is_empty() || batch.iter().any(|row| !row.images.is_empty())
+            }
+            TurnPrompt::Injected(message) => Self::custom_message_carries_images(message),
+        };
+        if let Err(refusal) = self.arm_image_turn_route(carries_images) {
+            emit(EngineEvent::Done(Err(refusal)));
+            return;
+        }
+        self.run_turns(turn_prompt, aborted, &mut emit);
+        let image_routed = self.armed_image_route().is_some();
+        self.clear_image_route();
+        if image_routed {
+            emit(EngineEvent::ModelRestore);
+        }
+    }
+
+    fn drone_request_control(&self) -> Option<pa_agent::agent_loop::request::RequestControl> {
+        self.turn_agent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|agent| agent.request_control())
+    }
+
+    fn set_drone_admission(&self, admission: Arc<dyn Fn(&mut dyn FnMut()) -> bool + Send + Sync>) {
+        *self.drone_admission.lock().unwrap() = Some(admission.clone());
+        if let Some(control) = self.drone_request_control() {
+            control.set_admission(admission);
+        }
+    }
+    fn set_drone_resume_guard(&self, guard: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.drone_resume_guard.lock().unwrap() = Some(guard.clone());
+        if let Some(control) = self.drone_request_control() {
+            control.set_resume_guard(guard);
+        }
+    }
+
+    fn abort_in_flight_turn(&self) {
+        // The active run aborts and the in-flight fetch cancels; none in flight: nothing.
+        let agent = self.turn_agent.lock().expect("turn agent lock").clone();
+        if let Some(agent) = agent {
+            agent.abort();
+        }
+    }
+
+    /// `set_steering_mode` / `set_follow_up_mode`: the queue delivery modes
+    /// switch live — the slot feeds any later build, and the agent drains
+    /// by the new mode from the next boundary.
+    fn set_queue_modes(&self, steering: Option<&str>, follow_up: Option<&str>) {
+        {
+            let mut modes = self.queue_modes.lock().expect("queue modes");
+            if let Some(mode) = steering {
+                modes.0 = Some(mode.to_string());
+            }
+            if let Some(mode) = follow_up {
+                modes.1 = Some(mode.to_string());
+            }
+        }
+        let agent = self.turn_agent.lock().expect("turn agent lock").clone();
+        if let Some(agent) = agent {
+            if let Some(mode) = steering.and_then(Self::queue_mode) {
+                agent.set_steering_mode(mode);
+            }
+            if let Some(mode) = follow_up.and_then(Self::queue_mode) {
+                agent.set_follow_up_mode(mode);
+            }
+        }
+    }
+}

@@ -1,0 +1,142 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pa-telemetry",
+    "crates/pa-types",
+    "crates/pa-ai",
+    "crates/pa-models",
+    "crates/pa-agent",
+    "crates/pa-core",
+    "crates/pa-daemon",
+    "crates/pa-tui",
+    "crates/pa-cli",
+    "crates/pa-perf",
+]
+
+# Crossterm 0.28.1's kitty support check holds the process-wide event reader
+# for 2s on terminals that do not answer. Keep its parser/queued input intact,
+# but cap the query poll to 250ms (late real-terminal replies still get a chance).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
+
+[workspace.package]
+version = "0.10.2"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order: serde_json::Map keeps insertion order (IndexMap) so every
+# wire/durable JSON surface serializes in construction order — the JS object
+# model the TS daemon and session files byte-emit. Without it the Map is a
+# BTreeMap and every Value-built frame re-sorts its keys alphabetically,
+# diverging from the TS byte stream (e.g. compaction `details` order).
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = { version = "0.1", features = ["attributes"] }
+pa-telemetry = { path = "crates/pa-telemetry" }
+pa-types = { path = "crates/pa-types" }
+pa-ai = { path = "crates/pa-ai" }
+pa-agent = { path = "crates/pa-agent" }
+thiserror = "2"
+futures = "0.3"
+toml = "0.9"
+# Dev-only; the default fork/timeout features are unused.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# The pedantic gate the five clippy campaigns earned (pa-daemon #3029,
+# pa-cli #3050, pa-core #3093, the small crates #3110, pa-tui #3134):
+# every workspace member is pedantic-clean; CI's -D warnings bar turns
+# this warn class into errors, and the per-crate #![allow] exceptions
+# (the design-choice classes, each with its in-code justification) keep
+# their force under the manifest route.
+pedantic = "warn"
+redundant_clone = "warn"
+clone_on_copy = "warn"
+assigning_clones = "warn"
+unnecessary_to_owned = "warn"
+uninlined_format_args = "warn"
+collapsible_if = "warn"
+redundant_closure_for_method_calls = "warn"
+unnested_or_patterns = "warn"
+unreadable_literal = "warn"
+duration_suboptimal_units = "warn"
+map_unwrap_or = "warn"
+match_same_arms = "warn"
+single_match_else = "warn"
+needless_continue = "warn"
+items_after_statements = "warn"
+if_not_else = "warn"
+semicolon_if_nothing_returned = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+doc_markdown = "warn"
+bool_to_int_with_if = "warn"
+case_sensitive_file_extension_comparisons = "warn"
+cloned_instead_of_copied = "warn"
+default_trait_access = "warn"
+elidable_lifetime_names = "warn"
+enum_glob_use = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+filter_map_next = "warn"
+flat_map_option = "warn"
+format_collect = "warn"
+format_push_string = "warn"
+ignore_without_reason = "warn"
+ignored_unit_patterns = "warn"
+implicit_clone = "warn"
+manual_assert = "warn"
+manual_assert_eq = "warn"
+manual_instant_elapsed = "warn"
+manual_is_variant_and = "warn"
+manual_let_else = "warn"
+manual_string_new = "warn"
+match_bool = "warn"
+match_wildcard_for_single_variants = "warn"
+needless_raw_string_hashes = "warn"
+no_effect_underscore_binding = "warn"
+nonminimal_bool = "warn"
+overly_complex_bool_expr = "warn"
+range_plus_one = "warn"
+redundant_else = "warn"
+return_self_not_must_use = "warn"
+single_char_pattern = "warn"
+stable_sort_primitive = "warn"
+str_split_at_newline = "warn"
+unicode_not_nfc = "warn"
+unchecked_time_subtraction = "warn"
+unnecessary_debug_formatting = "warn"
+unnecessary_join = "warn"
+unnecessary_literal_bound = "warn"
+unnecessary_semicolon = "warn"
+used_underscore_binding = "warn"
+
+# Shipping posture, pinned (Kevin, Option C): thin LTO plus 4 codegen
+# units for cross-crate inlining in the hot render path. Builds emit line
+# tables and do NOT strip at link: the release pipeline's split_debug step
+# produces the SHIPPED binary (objcopy --strip-debug — DWARF gone, function
+# names stay) and the split-debug decoder sidecar (objcopy
+# --only-keep-debug, gzipped) from the SAME linked image, so the decoder's
+# addresses match the shipped binary exactly. A second unstripped build
+# would NOT match: link-stage layout differs when stripping runs at link
+# (measured: .text sha256 differs between the link-strip and no-strip
+# builds of the same source). TRADEOFF, stated explicitly: the shipped
+# binary's panic backtraces keep function names but lose file:line; the
+# decoder restores file:line offline and ships as a SEPARATE release
+# asset, never install payload (assemble_artifacts.py hard-fails on
+# decoder sidecars). .dynsym survives stripping, so dynamic linking and
+# the release GLIBC baseline gate are unaffected. macOS is unchanged:
+# darwin builds keep line tables in the executable (dSYM extraction is a
+# documented follow-up); byte claims are measured on Linux x86_64 ELF
+# only.
+[profile.release]
+lto = "thin"
+codegen-units = 4
+debug = "line-tables-only"

@@ -1,0 +1,419 @@
+//! Worker summary/wire unit tests.
+use super::*;
+
+fn inputs() -> SummaryInputs {
+    SummaryInputs {
+        thinking_level: "default".to_string(),
+        model: None,
+        model_fallback_message: None,
+        bash_running: false,
+        background_bash: false,
+        quota_parked: false,
+        subagents_running: false,
+        progress_note: None,
+    }
+}
+
+#[test]
+fn sender_child_edge_decides_the_relationship_label() {
+    let true_child = json!({
+        "activeSessionId": "ddd444",
+        "runtimeKind": "subagent",
+        "parentSessionId": "sess-a",
+    });
+    assert!(sender_parent_edge_is(
+        &true_child,
+        Some("sess-a"),
+        "aaa111",
+        None
+    ));
+    let live_child = json!({
+        "activeSessionId": "eee555",
+        "runtimeKind": "subagent",
+        "parentActiveSessionId": "aaa111",
+    });
+    assert!(sender_parent_edge_is(
+        &live_child,
+        Some("sess-a"),
+        "aaa111",
+        None
+    ));
+    let foreign_child = json!({
+        "activeSessionId": "fff666",
+        "runtimeKind": "subagent",
+        "parentSessionId": "sess-zz",
+    });
+    assert!(!sender_parent_edge_is(
+        &foreign_child,
+        Some("sess-a"),
+        "aaa111",
+        None
+    ));
+    let edgeless = json!({ "activeSessionId": "ggg777", "runtimeKind": "subagent" });
+    assert!(!sender_parent_edge_is(
+        &edgeless,
+        Some("sess-a"),
+        "aaa111",
+        None
+    ));
+    let moved_child = json!({
+        "activeSessionId": "hhh888",
+        "runtimeKind": "subagent",
+        "parentSessionPath": "/old/root/sessions/01a0d0a5-e954-71b7-8479-8dc7980768a1.jsonl",
+    });
+    assert!(sender_parent_edge_is(
+        &moved_child,
+        Some("sess-a"),
+        "aaa111",
+        Some(std::path::Path::new(
+            "/new/root/sessions/01a0d0a5-e954-71b7-8479-8dc7980768a1.jsonl"
+        )),
+    ));
+}
+
+#[test]
+fn summary_lifecycle_is_message_based() {
+    let empty = SessionCore::test_core(None, "/tmp".to_string());
+    assert_eq!(session_summary(&empty, inputs()).lifecycle, "draft");
+    let mut subagent = SessionCore::test_core(None, "/tmp".to_string());
+    subagent.runtime_kind = "subagent".to_string();
+    assert_eq!(session_summary(&subagent, inputs()).lifecycle, "live");
+    // The busy-flip roster delta fires before the store flushes the admitted
+    // prompt; a busy turn is live at that wire moment.
+    let mut busy = SessionCore::test_core(None, "/tmp".to_string());
+    busy.busy = true;
+    busy.running_tool_calls.insert("call-1".to_string());
+    // `isRunningTools` is the streaming gate over the in-flight tool
+    // set.
+    assert!(session_summary(&busy, inputs()).is_running_tools);
+    busy.running_tool_calls.clear();
+    assert!(!session_summary(&busy, inputs()).is_running_tools);
+    busy.running_tool_calls.insert("call-1".to_string());
+    busy.busy = false;
+    assert!(!session_summary(&busy, inputs()).is_running_tools);
+    // The user bash state rides the summary as its own flag.
+    assert_eq!(
+        session_summary(
+            &busy,
+            SummaryInputs {
+                bash_running: true,
+                ..inputs()
+            },
+        )
+        .is_bash_running,
+        Some(true)
+    );
+    busy.busy = true;
+    assert_eq!(session_summary(&busy, inputs()).lifecycle, "live");
+    let dir = std::env::temp_dir().join(format!("pa-worker-lc-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+    let path = dir.join(crate::session_store::session_file_name(
+        session.session_id(),
+    ));
+    session.set_path(path);
+    session.append_message(&serde_json::json!({
+        "role": "user", "content": "hi", "timestamp": 1u64
+    }));
+    session.rewrite().unwrap();
+    let with_message = SessionCore::test_core(Some(session), "/tmp".to_string());
+    assert_eq!(session_summary(&with_message, inputs()).lifecycle, "live");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A session whose own turn ended keeps reporting `working` while any of
+/// its subagents runs (each child counts its own descendants the same
+/// way), so every roster surface classifies it running; with no running
+/// subagents it is idle again. Its own-work flag stays its own.
+#[test]
+fn running_subagents_keep_an_idle_session_working() {
+    let core = SessionCore::test_core(None, "/tmp".to_string());
+    let summary = |subagents_running| {
+        serde_json::to_value(session_summary(
+            &core,
+            SummaryInputs {
+                subagents_running,
+                ..inputs()
+            },
+        ))
+        .unwrap()
+    };
+    let classify =
+        |summary: &Value| pa_types::daemon::agent_roster::classify_summary_value(summary, false);
+    let waiting = summary(true);
+    assert_eq!(waiting["activity"], "working");
+    assert_eq!(waiting["hasRunningSubagents"], true);
+    assert_eq!(waiting["isSessionActive"], false);
+    assert_eq!(
+        classify(&waiting),
+        pa_types::daemon::agent_roster::AgentRosterStatus::Running
+    );
+    let done = summary(false);
+    assert_eq!(done["activity"], "idle");
+    assert_eq!(
+        classify(&done),
+        pa_types::daemon::agent_roster::AgentRosterStatus::Idle
+    );
+}
+
+/// The live row's `usage` is the whole-file own-usage fold the saved
+/// row publishes, including spend before the latest compaction and the
+/// compaction's own call.
+#[test]
+fn live_summary_usage_is_the_catalog_fold() {
+    let dir = std::env::temp_dir().join(format!("pa-worker-usage-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("live-usage.jsonl");
+    let usage = |input: u64, output: u64, cost: f64| {
+        json!({
+            "input": input, "output": output, "cacheRead": 0, "cacheWrite": 0,
+            "totalTokens": input + output,
+            "cost": { "input": 0.0, "output": cost, "cacheRead": 0.0, "cacheWrite": 0.0, "total": cost },
+        })
+    };
+    let assistant = |id: &str, parent: &str, cost: f64| {
+        json!({
+            "type": "message", "id": id, "parentId": parent,
+            "timestamp": "2026-09-23T00:00:00.000Z",
+            "message": {
+                "role": "assistant", "provider": "prime-inference",
+                "model": "internal/glm-5.3-fast", "content": [], "stopReason": "stop",
+                "usage": usage(100, 10, cost),
+            },
+        })
+        .to_string()
+    };
+    let user = |id: &str, parent: Option<&str>| {
+        json!({
+            "type": "message", "id": id, "parentId": parent,
+            "timestamp": "2026-09-23T00:00:00.000Z",
+            "message": { "role": "user", "content": "hi" },
+        })
+        .to_string()
+    };
+    let lines = [
+        json!({"type": "session", "version": 3, "id": "s1", "timestamp": "2026-09-23T00:00:00.000Z", "cwd": "/tmp"}).to_string(),
+        user("u1", None),
+        assistant("a1", "u1", 1.0),
+        json!({
+            "type": "compaction", "id": "c1", "parentId": "a1",
+            "timestamp": "2026-09-23T00:00:00.000Z",
+            "summary": "s", "firstKeptEntryId": "u2", "tokensBefore": 100,
+            "usage": usage(20, 2, 0.25),
+        })
+        .to_string(),
+        user("u2", Some("c1")),
+        assistant("a2", "u2", 0.5),
+    ];
+    std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    let store = crate::session_store::SessionFile::open_windowed(&path).unwrap();
+    assert!(
+        store.window.is_some(),
+        "the fixture must serve a windowed open"
+    );
+    let core = SessionCore::test_core(Some(store), "/tmp".to_string());
+    let summary = session_summary(&core, inputs());
+    // The live row equals the saved row, whole-object.
+    let catalog = crate::session_store::read_session_info(&path)
+        .unwrap()
+        .usage
+        .expect("the catalog fold bills the whole file");
+    assert_eq!(
+        json!(summary.usage),
+        json!(catalog),
+        "live and catalog rows agree"
+    );
+    // The whole file's own spend: the pre-cut turn + the summarizer
+    // + the kept turn, tokens folded in.
+    assert_eq!(
+        json!(summary.usage),
+        json!({ "inputTokens": 220, "outputTokens": 22, "cost": 1.75 })
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The live row bills the turn's own spend instead of reporting nothing.
+#[test]
+fn pathless_summary_usage_folds_the_in_memory_entries() {
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    assert!(store.path.as_os_str().is_empty(), "the store is pathless");
+    store.append_message(&json!({
+        "role": "user", "content": "hi", "timestamp": 1u64,
+    }));
+    store.append_message(&json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "done" }],
+        "provider": "p", "model": "m", "stopReason": "stop",
+        "timestamp": 2u64,
+        "usage": {
+            "input": 100, "output": 10, "cacheRead": 0, "cacheWrite": 0,
+            "totalTokens": 110,
+            "cost": { "input": 0.0, "output": 0.5, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.5 },
+        },
+    }));
+    let core = SessionCore::test_core(Some(store), "/tmp".to_string());
+    let summary = session_summary(&core, inputs());
+    assert_eq!(
+        json!(summary.usage),
+        json!({ "inputTokens": 100, "outputTokens": 10, "cost": 0.5 })
+    );
+}
+
+/// #4: a resumed session's summary counts the tool calls its file already
+/// holds, so a revived child's `toolUseCount` never resets (TS counts a
+/// run-less child's assistant tool calls).
+#[tokio::test]
+async fn a_resumed_sessions_summary_counts_its_persisted_tool_calls() {
+    let dir = std::env::temp_dir().join(format!("pa-worker-tools-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tool-count.jsonl");
+    let header = json!({
+        "type": "session", "version": 3, "id": "tool-count",
+        "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/tmp",
+    });
+    let user = json!({
+        "type": "message", "id": "u1", "parentId": null,
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "message": { "role": "user", "content": "run it" },
+    });
+    let tools = json!({
+        "type": "message", "id": "a1", "parentId": "u1",
+        "timestamp": "2026-01-01T00:00:01.000Z",
+        "message": {
+            "role": "assistant",
+            "content": [
+                { "type": "toolCall", "toolCallId": "t1", "name": "bash", "arguments": {} },
+                { "type": "toolCall", "toolCallId": "t2", "name": "edit", "arguments": {} },
+            ],
+            "provider": "p", "model": "m", "stopReason": "toolUse",
+        },
+    });
+    std::fs::write(&path, format!("{header}\n{user}\n{tools}\n")).unwrap();
+    let config = WorkerConfig {
+        socket_path: dir.join("worker.sock"),
+        supervisor_socket_path: std::path::PathBuf::new(),
+        token: "token".to_string(),
+        worker_instance_id: String::new(),
+        active_session_id: "tool-count".to_string(),
+        agent_dir: dir.join("agent"),
+        recovery_journal_path: dir.join("recovery.jsonl"),
+        telemetry_disabled: None,
+        script: Some(json!({ "responses": [] })),
+    };
+    let worker = Worker::new(config, None);
+    let resumed = worker
+        .dispatch(
+            "create",
+            &json!({
+                "cwd": "/tmp",
+                "sessionPath": path,
+                "name": "resumed",
+            }),
+        )
+        .await;
+    assert!(resumed.success, "resume failed: {resumed:?}");
+    let state = worker.dispatch("get_state", &json!({})).await;
+    assert!(state.success, "get_state failed: {state:?}");
+    assert_eq!(
+        state.data.unwrap_or(Value::Null)["toolUseCount"],
+        json!(2),
+        "the resumed summary counts the persisted tool calls"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn display_ids_are_twelve_hex() {
+    let id = crate::util::new_display_id();
+    assert_eq!(id.len(), 12);
+    assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+/// The summary carries the live note, and the next run's boundaries clear it.
+#[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+#[tokio::test]
+async fn summary_carries_the_live_note_until_the_run_boundaries_clear_it() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = std::env::temp_dir().join(format!("pa-worker-note-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = WorkerConfig {
+        socket_path: dir.join("worker.sock"),
+        supervisor_socket_path: std::path::PathBuf::new(),
+        token: "token".to_string(),
+        worker_instance_id: String::new(),
+        active_session_id: "note-session".to_string(),
+        agent_dir: dir.join("agent"),
+        recovery_journal_path: dir.join("recovery.jsonl"),
+        telemetry_disabled: None,
+        script: Some(json!({
+            "engine": "faux",
+            "responses": ["first reply", "second reply"],
+        })),
+    };
+    let worker = std::sync::Arc::new(Worker::new(config, None));
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": "/tmp", "name": "note" }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    let first = worker
+        .dispatch(
+            "prompt_and_wait",
+            &json!({ "activeSessionId": "note-session", "message": "hello" }),
+        )
+        .await;
+    assert!(first.success, "the first turn failed: {first:?}");
+    let engine = worker
+        .agent_engine
+        .as_ref()
+        .expect("the faux worker runs the real engine");
+    let notes = engine
+        .progress_notes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .expect("the built session mirrored its note store");
+    assert!(
+        notes.note("running tests", 0).accepted,
+        "the fresh store accepts the injected note"
+    );
+    let state = worker.dispatch("get_state", &json!({})).await;
+    assert!(state.success, "get_state failed: {state:?}");
+    assert_eq!(
+        state.data.as_ref().unwrap_or(&Value::Null)["progressNote"],
+        json!("running tests"),
+        "the summary carries the live note: {state:?}"
+    );
+    let second = worker
+        .dispatch(
+            "prompt_and_wait",
+            &json!({ "activeSessionId": "note-session", "message": "again" }),
+        )
+        .await;
+    assert!(second.success, "the second turn failed: {second:?}");
+    let state = worker.dispatch("get_state", &json!({})).await;
+    let summary = state.data.unwrap_or(Value::Null);
+    assert!(
+        summary.get("progressNote").is_none(),
+        "the run boundary cleared the note: {summary:?}"
+    );
+}
+
+#[test]
+fn summary_distinguishes_kernel_background_bash_from_user_bash() {
+    let core = SessionCore::test_core(None, "/tmp".to_string());
+    let summary = session_summary(
+        &core,
+        SummaryInputs {
+            background_bash: true,
+            ..inputs()
+        },
+    );
+    let wire = serde_json::to_value(summary).unwrap();
+    assert_eq!(wire["hasBackgroundBash"], true);
+    assert_eq!(wire["isBashRunning"], false);
+}

@@ -1,0 +1,911 @@
+//! The `/model` picker's catalog surface: serve the current validated
+//! snapshot instantly and refresh in the background (a deliberate
+//! divergence from TS, which awaits the refresh inside the request); a
+//! changed snapshot broadcasts `model_catalog_changed`.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+
+use crate::protocol::{response_success, DaemonResponse};
+use crate::worker::{OutboundFrame, Worker};
+
+/// The catalog background-refresh coalescing gate: at most one refresh
+/// with one queued trailing re-arm, so concurrent opens cost one cycle.
+#[derive(Default)]
+pub(crate) struct RefreshGate {
+    in_flight: std::sync::atomic::AtomicBool,
+    queued: std::sync::atomic::AtomicBool,
+}
+
+impl Worker {
+    /// `get_model_catalog`: the full catalog and configured providers from
+    /// the current validated snapshot — never a network request here.
+    pub(crate) fn handle_get_model_catalog(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("get_model_catalog") {
+            return response;
+        }
+        let agent_dir = self.config.agent_dir.clone();
+        let models_json = agent_dir.join("models.json");
+        let mut registry = pa_core::models::ModelRegistry::create(
+            pa_core::auth::AuthStorage::create(&agent_dir),
+            models_json.clone(),
+        );
+        // The on-disk private authorization (fingerprint-checked): the
+        // validated current view of the account's private models, no network.
+        registry.load_private_authorization_from_cache();
+        let available = registry
+            .get_available()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let served = catalog_payload(&registry, &available);
+        // An observed credential-scope change forces the refresh; the
+        // observation consumes the scope, so one change forces exactly once.
+        let credentials = pa_core::models::prime_credentials_for_dir(&agent_dir);
+        let catalog = pa_core::models::catalog_for(Some(&models_json));
+        let trigger = if catalog.credentials_changed(credentials.as_ref()) {
+            pa_core::models::RefreshTrigger::AuthChange
+        } else {
+            pa_core::models::RefreshTrigger::PickerOpen
+        };
+        self.spawn_catalog_refresh(trigger, served.clone());
+        response_success(None, "get_model_catalog", Some(served))
+    }
+
+    /// The background catalog refresh: the same awaited chain the TS
+    /// request runs, settled off the response path; failures keep the
+    /// last-good snapshot and stay silent.
+    fn spawn_catalog_refresh(&self, trigger: pa_core::models::RefreshTrigger, served: Value) {
+        let gate = std::sync::Arc::clone(&self.model_catalog_refresh_gate);
+        if gate.in_flight.swap(true, Ordering::SeqCst) {
+            // A refresh already runs: remember the request and return — the
+            // running task re-arms exactly once when it lands.
+            gate.queued.store(true, Ordering::SeqCst);
+            return;
+        }
+        let agent_dir = self.config.agent_dir.clone();
+        let events = Arc::clone(&self.events);
+        tokio::spawn(async move {
+            let mut baseline = served;
+            let mut trigger = trigger;
+            loop {
+                let auth = pa_core::auth::AuthStorage::create(&agent_dir);
+                let mut registry =
+                    pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
+                let available = registry
+                    .refresh_available_models_with_trigger(trigger)
+                    .await;
+                let refreshed = catalog_payload(&registry, &available);
+                if refreshed != baseline {
+                    events.send(OutboundFrame::model_catalog_changed());
+                }
+                baseline = refreshed;
+                gate.in_flight.store(false, Ordering::SeqCst);
+                if !gate.queued.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                if gate.in_flight.swap(true, Ordering::SeqCst) {
+                    // A later request re-armed first; its task covers the
+                    // trailing refresh.
+                    return;
+                }
+                // The trailing re-arm stays gated: the next request's own
+                // scope observation re-detects and forces any flip.
+                trigger = pa_core::models::RefreshTrigger::PickerOpen;
+            }
+        });
+    }
+}
+
+/// The wire payload of one catalog snapshot: the full catalog minus
+/// unauthorized private Prime Inference models, plus sorted providers.
+fn catalog_payload(
+    registry: &pa_core::models::ModelRegistry,
+    available: &[pa_types::ai::Model],
+) -> Value {
+    let mut providers: Vec<String> = available
+        .iter()
+        .map(|model| model.provider.clone())
+        .collect();
+    providers.sort();
+    providers.dedup();
+    let available_keys: std::collections::HashSet<String> = available
+        .iter()
+        .map(|model| format!("{}/{}", model.provider, model.id))
+        .collect();
+    // Canonical (provider, id) order: the private-models append comes from
+    // a HashMap iteration, so identical sets would serialize differently.
+    let mut entries: Vec<&pa_types::ai::Model> = registry
+        .get_all()
+        .iter()
+        .filter(|model| {
+            !pa_core::models::is_private_prime_inference_model(model)
+                || available_keys.contains(&format!("{}/{}", model.provider, model.id))
+        })
+        .collect();
+    entries.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
+    let models: Vec<Value> = entries
+        .into_iter()
+        .map(|model| serde_json::to_value(model).unwrap_or(Value::Null))
+        .collect();
+    json!({
+        "models": models,
+        "configuredProviders": providers,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::WorkerConfig;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // NOTE on ambient credentials: these tests pin the Prime Inference
+    // scope through the temp agent dir's auth.json — an ambient
+    // `PRIME_API_KEY` would win over the stored credential and change
+    // the resolved scope.
+
+    /// One scripted answer: raw bytes, or a gate the test releases.
+    enum Answer {
+        Raw(Vec<u8>),
+        Gate(tokio::sync::oneshot::Receiver<Vec<u8>>),
+    }
+
+    /// A scripted loopback HTTP server for the two catalog fetch layers:
+    /// every request head is recorded; answers come from a shared queue
+    /// (the last raw answer repeats; a gate parks its request).
+    struct CatalogServer {
+        port: u16,
+        requests: Arc<Mutex<Vec<String>>>,
+        answers: Arc<Mutex<VecDeque<Answer>>>,
+    }
+
+    impl CatalogServer {
+        async fn start(answers: Vec<Answer>) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock catalog server");
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let answers = Arc::new(Mutex::new(VecDeque::from(answers)));
+            let server_requests = Arc::clone(&requests);
+            let server_answers = Arc::clone(&answers);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let requests = Arc::clone(&server_requests);
+                    let answers = Arc::clone(&server_answers);
+                    tokio::spawn(async move {
+                        let mut socket = socket;
+                        let mut buffer = [0u8; 8_192];
+                        let mut read = 0usize;
+                        loop {
+                            let Ok(n) = socket.read(&mut buffer[read..]).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            read += n;
+                            if buffer[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            if read == buffer.len() {
+                                break;
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        requests.lock().expect("request log").push(head);
+                        let answer = answers.lock().expect("answer queue").pop_front();
+                        let response = match answer {
+                            Some(Answer::Raw(bytes)) => bytes,
+                            Some(Answer::Gate(receiver)) => match receiver.await {
+                                Ok(bytes) => bytes,
+                                Err(_) => status(500, "Gate Closed"),
+                            },
+                            None => status(500, "Drained"),
+                        };
+                        let _ = socket.write_all(&response).await;
+                        let _ = socket.flush().await;
+                    });
+                }
+            });
+            Self {
+                port,
+                requests,
+                answers,
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{path}", self.port)
+        }
+
+        fn recorded_requests(&self) -> Vec<String> {
+            self.requests.lock().expect("request log").clone()
+        }
+
+        fn push(&self, answer: Answer) {
+            self.answers.lock().expect("answer queue").push_back(answer);
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().expect("request log").len()
+        }
+    }
+
+    fn ok_json(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn status(code: u16, reason: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {code} {reason}\r\ncontent-length: 0\r\n\r\n").into_bytes()
+    }
+
+    /// A gate the test releases later (the held-open catalog fetch).
+    fn gate() -> (tokio::sync::oneshot::Sender<Vec<u8>>, Answer) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (sender, Answer::Gate(receiver))
+    }
+
+    /// One provider-catalog aggregate entry riding a compiled transport
+    /// tuple (probe ids must stay outside the compiled catalog).
+    fn catalog_aggregate(ids: &[&str]) -> String {
+        let anthropic = pa_models::transports::compiled_models()
+            .iter()
+            .find(|model| model.provider == "anthropic")
+            .expect("compiled anthropic tuple")
+            .clone();
+        let models: Vec<Value> = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "name": id,
+                    "api": anthropic.api,
+                    "provider": anthropic.provider,
+                    "baseUrl": anthropic.base_url,
+                    "reasoning": false,
+                    "input": ["text"],
+                    "cost": {"input": 1.0, "output": 1.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+                    "contextWindow": 128_000,
+                    "maxTokens": 4_096,
+                })
+            })
+            .collect();
+        serde_json::to_string(&json!({"schemaVersion": 1, "models": models})).unwrap()
+    }
+
+    /// The Prime Inference `/models` payload: every compiled entry (the
+    /// coverage gate needs them) plus one public marker the compiled
+    /// catalog provably lacks, so a landed refresh visibly changes it.
+    fn pi_snapshot_payload(marker: &str) -> String {
+        let mut data: Vec<Value> = pa_models::transports::prime_inference_offline_entries()
+            .iter()
+            .map(|model| {
+                json!({
+                    "id": model.id,
+                    "display_name": model.name,
+                    "pricing": {
+                        "input_usd_per_mtok": model.cost.input.as_f64(),
+                        "output_usd_per_mtok": model.cost.output.as_f64(),
+                    },
+                    "specs": {
+                        "context_window": model.context_window,
+                        "max_output_tokens": model.max_tokens,
+                        "supports_reasoning": model.reasoning,
+                        "modalities": {"input": ["text"], "output": ["text"]},
+                    },
+                })
+            })
+            .collect();
+        data.push(json!({
+            "id": marker,
+            "display_name": marker,
+            "pricing": {"input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0},
+            "specs": {
+                "context_window": 200_000,
+                "max_output_tokens": 32_768,
+                "supports_reasoning": true,
+                "modalities": {"input": ["text"], "output": ["text"]},
+            },
+        }));
+        serde_json::to_string(&json!({"data": data})).unwrap()
+    }
+
+    /// The private-model entitlement payload: full-specs entries for
+    /// exactly the ids the account is authorized for.
+    fn private_payload(ids: &[&str]) -> String {
+        let data: Vec<Value> = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "display_name": id,
+                    "pricing": {"input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0},
+                    "specs": {
+                        "context_window": 200_000,
+                        "max_output_tokens": 32_768,
+                        "supports_reasoning": true,
+                        "modalities": {"input": ["text"], "output": ["text"]},
+                    },
+                })
+            })
+            .collect();
+        serde_json::to_string(&json!({"data": data})).unwrap()
+    }
+
+    /// A private entitlement payload whose route declares the live reasoning
+    /// parameters (`supported_parameters` with `reasoning`/`reasoning_effort`
+    /// plus the supported efforts) — the shape the internal `DeepSeek` routes
+    /// serve: reasoning arrives only when a request addresses it.
+    fn reasoning_private_payload(id: &str) -> String {
+        serde_json::to_string(&json!({
+            "data": [{
+                "id": id,
+                "display_name": id,
+                "pricing": {"input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0},
+                "specs": {
+                    "context_window": 200_000,
+                    "max_output_tokens": 32_768,
+                    "supports_reasoning": true,
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                },
+                "supported_parameters": [
+                    "max_tokens", "temperature", "tools", "tool_choice",
+                    "reasoning", "reasoning_effort",
+                ],
+                "reasoning": {
+                    "supported_efforts": ["none", "low", "high", "max"],
+                    "default_effort": "high",
+                },
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn write_auth_json(agent_dir: &Path, api_key: &str, team_id: &str) {
+        std::fs::write(
+            agent_dir.join("auth.json"),
+            json!({
+                "prime-inference": {
+                    "type": "api_key",
+                    "key": api_key,
+                    "primeTeam": {"teamId": team_id, "name": "Catalog Team"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write auth.json");
+    }
+
+    fn write_models_json(agent_dir: &Path) {
+        std::fs::create_dir_all(agent_dir).expect("agent dir");
+        std::fs::write(
+            agent_dir.join("models.json"),
+            json!({
+                "providers": {
+                    "prime-inference": {
+                        "api": "openai-completions",
+                        "baseUrl": "http://127.0.0.1:9/v1",
+                        "apiKey": "sk-catalog-worker",
+                        "models": [
+                            {"id": "mock-1", "name": "Mock 1", "api": "openai-completions",
+                             "baseUrl": "http://127.0.0.1:9/v1", "contextWindow": 128_000,
+                             "maxTokens": 4096}
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write models.json");
+    }
+
+    /// The hermetic fixture: a temp agent dir, both fetch layers aimed at
+    /// the scripted server, a process-shared catalog, and a created
+    /// worker. Returns once the create-path refresh has fully settled,
+    /// so later fetch counts are deterministic.
+    struct Fixture {
+        dir: PathBuf,
+        agent_dir: PathBuf,
+        server: CatalogServer,
+        worker: Arc<Worker>,
+        events: tokio::sync::broadcast::Receiver<Arc<OutboundFrame>>,
+    }
+
+    async fn fixture(create_answers: Vec<Answer>) -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "pa-model-catalog-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let agent_dir = dir.join("agent");
+        write_models_json(&agent_dir);
+        write_auth_json(&agent_dir, "sk-account-a", "team-a");
+        let server = CatalogServer::start(create_answers).await;
+        let bundled_dir = dir.join("bundled");
+        std::fs::create_dir_all(&bundled_dir).expect("bundled dir");
+        let catalog = pa_models::ModelCatalog::with_urls(
+            Some(agent_dir.join("models")),
+            Some(bundled_dir),
+            &server.url("/catalog"),
+            &server.url("/api/v1"),
+        );
+        pa_core::models::install_catalog(&agent_dir.join("models.json"), Arc::new(catalog));
+        let config = WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "catalog-session".to_string(),
+            agent_dir: agent_dir.clone(),
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "responses": ["ack"] })),
+        };
+        let worker = Arc::new(Worker::new(config, None));
+        let events = worker.events.subscribe();
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({ "noSession": true, "cwd": dir.to_string_lossy() }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        // The create path's background refresh settles when its last
+        // write lands (the private-authorization cache).
+        let private_cache = agent_dir.join("prime-inference-private-models.json");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !private_cache.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the create-path refresh never settled; requests so far: {:?}",
+                server.recorded_requests()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Fixture {
+            dir,
+            agent_dir,
+            server,
+            worker,
+            events,
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The initial answers for the create-path refresh (key sk-account-a,
+    /// team team-a): the v1 catalog aggregate, the team-a snapshot (with
+    /// the team-a private entitlement), and the matching authorization.
+    fn create_phase_answers() -> Vec<Answer> {
+        vec![
+            Answer::Raw(ok_json(&catalog_aggregate(&["probe-v1"]))),
+            Answer::Raw(ok_json(&pi_snapshot_payload("live/team-a-marker"))),
+            Answer::Raw(ok_json(&private_payload(&["internal/team-a-private"]))),
+        ]
+    }
+
+    async fn get_model_catalog(worker: &Worker, session: &str) -> Value {
+        let response = worker
+            .dispatch("get_model_catalog", &json!({ "activeSessionId": session }))
+            .await;
+        assert!(response.success, "get_model_catalog failed: {response:?}");
+        response.data.expect("catalog payload")
+    }
+
+    fn has_model(payload: &Value, id: &str) -> bool {
+        payload["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .any(|model| model["id"] == id)
+    }
+
+    /// The payload's models are in canonical (provider, id) order: the
+    /// served and refreshed snapshots are compared verbatim.
+    fn assert_canonical_models_order(payload: &Value) {
+        let models = payload["models"].as_array().expect("models array");
+        let keys: Vec<(String, String)> = models
+            .iter()
+            .map(|model| {
+                (
+                    model["provider"].as_str().unwrap_or_default().to_string(),
+                    model["id"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "the payload's models are canonically ordered");
+    }
+
+    /// Whether a `model_catalog_changed` frame arrives within `bound`
+    /// (other frames pass through): the negative-assert seam.
+    async fn catalog_changed_within(
+        events: &mut tokio::sync::broadcast::Receiver<Arc<OutboundFrame>>,
+        bound: Duration,
+    ) -> bool {
+        tokio::time::timeout(bound, async {
+            loop {
+                match events.recv().await {
+                    Ok(frame) if frame.outbound_type == "model_catalog_changed" => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Await the next `model_catalog_changed` frame (other frames pass
+    /// through; a bounded deadline replaces any fixed wait).
+    async fn await_catalog_changed(
+        events: &mut tokio::sync::broadcast::Receiver<Arc<OutboundFrame>>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("model_catalog_changed never landed");
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(frame)) if frame.outbound_type == "model_catalog_changed" => return,
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream error: {error}"),
+                Err(error) => panic!("model_catalog_changed never landed: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_open_returns_instantly_and_the_auth_change_refresh_lands() {
+        let mut fixture = fixture(create_phase_answers()).await;
+        // A login switched the account between the create path's warm-up
+        // and this picker open: the scope observation detects the change.
+        write_auth_json(&fixture.agent_dir, "sk-account-b", "team-b");
+        let (release, held) = gate();
+        fixture.server.push(held);
+        fixture
+            .server
+            .push(Answer::Raw(ok_json(&pi_snapshot_payload(
+                "live/team-b-marker",
+            ))));
+        fixture
+            .server
+            .push(Answer::Raw(ok_json(&private_payload(&[]))));
+        let requests_before = fixture.server.request_count();
+
+        let started = Instant::now();
+        let served = get_model_catalog(&fixture.worker, "catalog-session").await;
+        // The response returned while the catalog fetch was still held.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the picker-open response waited on the fetch"
+        );
+        assert!(has_model(&served, "mock-1"), "the custom models.json entry");
+        assert!(has_model(&served, "probe-v1"), "the warm provider catalog");
+        assert!(!has_model(&served, "live/team-a-marker"));
+        assert!(!has_model(&served, "live/team-b-marker"));
+        assert!(!has_model(&served, "internal/team-a-private"));
+
+        let _ = release.send(ok_json(&catalog_aggregate(&["probe-v1", "probe-v2"])));
+        await_catalog_changed(&mut fixture.events).await;
+        let fresh = get_model_catalog(&fixture.worker, "catalog-session").await;
+        assert!(
+            has_model(&fresh, "probe-v2"),
+            "the refreshed provider catalog"
+        );
+        assert_canonical_models_order(&fresh);
+        assert_canonical_models_order(&served);
+        assert!(has_model(&fresh, "live/team-b-marker"));
+        assert!(!has_model(&fresh, "live/team-a-marker"));
+        assert!(!has_model(&fresh, "internal/team-a-private"));
+        // The refreshed requests carried the new credentials only. The
+        // team header carries the account's EFFECTIVE team — an ambient
+        // `PRIME_TEAM_ID` pins it (the production pin), else team-b rides.
+        let pinned_team = std::env::var("PRIME_TEAM_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let expected_team = pinned_team.as_deref().unwrap_or("team-b");
+        let heads = fixture.server.recorded_requests();
+        assert!(heads.len() > requests_before, "the forced refresh fetched");
+        let refreshed_heads = &heads[requests_before..];
+        let auth_headers: Vec<&str> = refreshed_heads
+            .iter()
+            .filter_map(|head| {
+                head.lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            })
+            .collect();
+        assert!(
+            !auth_headers.is_empty(),
+            "the credentialed fetches exist in the refreshed log"
+        );
+        assert!(
+            auth_headers
+                .iter()
+                .all(|header| header.contains("Bearer sk-account-b")),
+            "no old credentials leak into the refreshed fetches: {auth_headers:?}"
+        );
+        // Header names are case-insensitive and the client writes them
+        // lowercase: match the name case-insensitively, the value exactly.
+        assert!(
+            refreshed_heads.iter().any(|head| {
+                head.to_ascii_lowercase()
+                    .contains(&format!("x-prime-team-id: {expected_team}"))
+            }),
+            "the private fetch rode the new effective team header ({expected_team}): {refreshed_heads:?}"
+        );
+        assert!(
+            refreshed_heads.iter().all(|head| !head
+                .to_ascii_lowercase()
+                .contains("x-prime-team-id: team-a")),
+            "the old account's team never rides the refreshed fetches: {refreshed_heads:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_opens_coalesce_into_one_refresh() {
+        let mut fixture = fixture(create_phase_answers()).await;
+        write_auth_json(&fixture.agent_dir, "sk-account-b", "team-b");
+        let (release, held) = gate();
+        fixture.server.push(held);
+        fixture
+            .server
+            .push(Answer::Raw(ok_json(&pi_snapshot_payload(
+                "live/team-b-marker",
+            ))));
+        fixture
+            .server
+            .push(Answer::Raw(ok_json(&private_payload(&[]))));
+        let requests_before = fixture.server.request_count();
+
+        let (first, second, third, fourth, fifth) = tokio::join!(
+            get_model_catalog(&fixture.worker, "catalog-session"),
+            get_model_catalog(&fixture.worker, "catalog-session"),
+            get_model_catalog(&fixture.worker, "catalog-session"),
+            get_model_catalog(&fixture.worker, "catalog-session"),
+            get_model_catalog(&fixture.worker, "catalog-session"),
+        );
+        for payload in [&first, &second, &third, &fourth, &fifth] {
+            assert!(has_model(payload, "probe-v1"), "the warm provider catalog");
+            assert_canonical_models_order(payload);
+        }
+        assert_eq!(
+            first, second,
+            "every concurrent open served the same canonical payload"
+        );
+        assert_eq!(second, third);
+        assert_eq!(third, fourth);
+        assert_eq!(fourth, fifth);
+        // Exactly one refresh left the worker while the provider fetch was
+        // held; the deadline is on the request log, never a fixed sleep.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fixture.server.request_count() < requests_before + 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the forced refresh never started: {:?}",
+                fixture.server.recorded_requests()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fixture.server.request_count() - requests_before,
+            1,
+            "only the one running refresh reached the server: {:?}",
+            fixture.server.recorded_requests()
+        );
+
+        // Release the held fetch: the one refresh cycle lands (provider +
+        // snapshot + entitlement = 3 requests total), the queued trailing
+        // re-arm finds every gate warm and fetches nothing.
+        let _ = release.send(ok_json(&catalog_aggregate(&["probe-v1", "probe-v2"])));
+        await_catalog_changed(&mut fixture.events).await;
+        assert_eq!(
+            fixture.server.request_count() - requests_before,
+            3,
+            "the burst cost exactly one refresh cycle: {:?}",
+            fixture.server.recorded_requests()
+        );
+        let fresh = get_model_catalog(&fixture.worker, "catalog-session").await;
+        assert!(has_model(&fresh, "probe-v2"));
+        assert!(has_model(&fresh, "live/team-b-marker"));
+        assert_canonical_models_order(&fresh);
+    }
+
+    /// Repeat picker opens inside the hourly window stay gated: no new
+    /// fetches, no event, so event -> re-fetch -> refresh terminates.
+    #[tokio::test]
+    async fn repeat_opens_inside_the_gate_add_no_fetches_and_stay_silent() {
+        let mut fixture = fixture(create_phase_answers()).await;
+        let requests_before = fixture.server.request_count();
+        for _ in 0..3 {
+            let served = get_model_catalog(&fixture.worker, "catalog-session").await;
+            assert!(has_model(&served, "probe-v1"));
+            assert!(has_model(&served, "live/team-a-marker"));
+        }
+        // The hourly gate held for every open (the create-path refresh
+        // armed it).
+        assert_eq!(
+            fixture.server.request_count(),
+            requests_before,
+            "repeat opens stayed gated"
+        );
+        // Nothing broadcast: a spurious broadcast lands inside the bound;
+        // an honestly gated refresh lets it elapse.
+        assert!(
+            !catalog_changed_within(&mut fixture.events, Duration::from_millis(250)).await,
+            "a gated refresh must not broadcast model_catalog_changed"
+        );
+    }
+
+    /// The private-route reasoning regression: a route that declares its
+    /// reasoning parameters (the live `internal/deepseek-v4.1-flash` shape)
+    /// must serve a model whose compat addresses them — the served catalog
+    /// reads the authorization cache back, so this pins the fetch build AND
+    /// the cache round-trip. Without the declared controls rebuilt into the
+    /// model, a thinking session sends no `reasoning_effort`, and a route
+    /// that only thinks when asked emits no thinking at all.
+    #[tokio::test]
+    async fn a_private_route_with_declared_reasoning_serves_addressable_levels() {
+        let answers = vec![
+            Answer::Raw(ok_json(&catalog_aggregate(&["probe-v1"]))),
+            Answer::Raw(ok_json(&pi_snapshot_payload("live/team-a-marker"))),
+            Answer::Raw(ok_json(&reasoning_private_payload(
+                "internal/team-a-private",
+            ))),
+        ];
+        let fixture = fixture(answers).await;
+
+        let served = get_model_catalog(&fixture.worker, "catalog-session").await;
+        assert_canonical_models_order(&served);
+        let model = served["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .find(|model| model["id"] == "internal/team-a-private")
+            .expect("the authorized private route");
+        assert_eq!(
+            model["compat"]["supportsReasoningEffort"], true,
+            "the declared reasoning_effort parameter must be addressable"
+        );
+        assert_eq!(model["thinkingLevelMap"]["high"], "high");
+        assert_eq!(model["thinkingLevelMap"]["low"], "low");
+        assert_eq!(model["thinkingLevelMap"]["max"], "max");
+        assert_eq!(model["thinkingLevelMap"]["off"], "none");
+    }
+
+    /// The malformed-entitlement regression: a 200 body without a `data`
+    /// array is a fetch failure, not an empty authorization — an empty
+    /// success would wipe the authorized private models and rewrite the
+    /// fingerprint cache with an empty set and a fresh TTL.
+    #[tokio::test]
+    async fn a_malformed_entitlement_payload_keeps_the_authorized_private_models() {
+        let fixture = fixture(create_phase_answers()).await;
+        // Age the on-disk authorization past its TTL so the next refresh
+        // refetches the entitlements in the background.
+        let cache_path = fixture
+            .agent_dir
+            .join("prime-inference-private-models.json");
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).expect("cache")).unwrap();
+        std::fs::write(
+            &cache_path,
+            serde_json::to_string(&json!({
+                "fingerprint": document["fingerprint"],
+                "data": document["data"],
+                "refreshedAt": 1u64,
+            }))
+            .unwrap(),
+        )
+        .expect("age the cache");
+        // The catalog chain stays hourly-gated from the create path; only the
+        // private entitlement fetch runs. Its answer is a held gate: the
+        // malformed body is released only after this test starts watching
+        // the cache, so the background refresh's write decision cannot slip
+        // in before the watch begins.
+        let (release, held) = gate();
+        fixture.server.push(held);
+        let requests_before = fixture.server.request_count();
+
+        let served = get_model_catalog(&fixture.worker, "catalog-session").await;
+        assert!(
+            has_model(&served, "internal/team-a-private"),
+            "the cached authorization serves instantly"
+        );
+        // The background entitlement fetch is recorded and parked on the
+        // gate; the deadline is on the request log, not a fixed wait.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fixture.server.request_count() < requests_before + 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the stale-cache background refresh never fetched: {:?}",
+                fixture.server.recorded_requests()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let aged_cache = std::fs::read_to_string(&cache_path).expect("cache");
+        // Release the malformed body. The empty-success bug applies the
+        // wipe and rewrites the cache the moment the refresh processes it;
+        // the bounded negative wait is the only way to prove the fixed
+        // path leaves the cache untouched.
+        let _ = release.send(ok_json(r#"{"data": {"not": "an array"}}"#));
+        let settle = Instant::now() + Duration::from_secs(2);
+        loop {
+            let cache = std::fs::read_to_string(&cache_path).expect("cache");
+            assert_eq!(
+                cache, aged_cache,
+                "a malformed entitlement payload must not rewrite the authorization cache"
+            );
+            if Instant::now() >= settle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let after = get_model_catalog(&fixture.worker, "catalog-session").await;
+        assert!(
+            has_model(&after, "internal/team-a-private"),
+            "a malformed entitlement payload must not wipe the authorized private models"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_keeps_the_last_good_catalog_and_stays_silent() {
+        let mut fixture = fixture(create_phase_answers()).await;
+        write_auth_json(&fixture.agent_dir, "sk-account-c", "team-c");
+        for _ in 0..3 {
+            fixture
+                .server
+                .push(Answer::Raw(status(500, "Catalog Down")));
+        }
+        let served = get_model_catalog(&fixture.worker, "catalog-session").await;
+        // The instant snapshot still serves the validated public view; the
+        // changed scope isolates the old account's credentialed entries.
+        assert!(has_model(&served, "probe-v1"));
+        assert!(!has_model(&served, "live/team-a-marker"));
+        assert!(!has_model(&served, "internal/team-a-private"));
+
+        // The forced refresh consumed its three failures; the deadline is
+        // on the request log, not on a fixed sleep.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fixture.server.request_count() < 3 + 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the failed refresh never ran; requests: {:?}",
+                fixture.server.recorded_requests()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !catalog_changed_within(&mut fixture.events, Duration::from_millis(250)).await,
+            "a failed refresh keeps the served snapshot and must stay silent"
+        );
+        let after = get_model_catalog(&fixture.worker, "catalog-session").await;
+        assert!(has_model(&after, "probe-v1"), "last-good retained");
+        assert!(!has_model(&after, "internal/team-a-private"));
+    }
+}

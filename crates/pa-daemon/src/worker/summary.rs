@@ -1,0 +1,686 @@
+//! The worker's client-visible surface: summaries, snapshots, the
+//! roster push, and the event emission family.
+use super::lifecycle::active_lifecycle;
+use super::{
+    checkpoint_queue_recovery, create_daemon_event_meta, is_injected_prompt_item,
+    is_rlm_child_status_item, json, AgentConnectionState, Arc, DaemonOutbound,
+    DaemonSessionClosedReason, EventPump, Map, Mutex, OutboundFrame, QueueCheckpoint, QueueLanes,
+    QueuedItem, Result, SessionActionSnapshot, SessionCore, SessionEngine, Value, Worker,
+};
+
+use crate::types::SessionSummary;
+
+impl Worker {
+    pub(crate) fn summary_inputs(&self) -> (std::sync::MutexGuard<'_, SessionCore>, SummaryInputs) {
+        SummaryInputs::lock(&self.core, self.engine.as_ref(), &self.user_bash)
+    }
+
+    pub(crate) fn connection_state_inputs(
+        &self,
+    ) -> (
+        std::sync::MutexGuard<'_, SessionCore>,
+        ConnectionStateInputs,
+    ) {
+        ConnectionStateInputs::lock(&self.core, self.engine.as_ref(), &self.user_bash)
+    }
+
+    pub(crate) fn attach_inputs(
+        &self,
+    ) -> (
+        std::sync::MutexGuard<'_, SessionCore>,
+        SummaryInputs,
+        ConnectionStateInputs,
+    ) {
+        loop {
+            let details = ModelDetails::read(self.engine.as_ref(), ModelDetailScope::Connection);
+            let core = self.core.lock().unwrap();
+            if self.engine.model_identity() == details.identity {
+                let identity = details.identity.clone();
+                let summary = SummaryInputs::capture(
+                    self.engine.as_ref(),
+                    &self.user_bash,
+                    details.model.clone(),
+                );
+                let connection =
+                    ConnectionStateInputs::capture(self.engine.as_ref(), &self.user_bash, details);
+                if self.engine.model_identity() == identity {
+                    return (core, summary, connection);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn summary_locked(
+        &self,
+        core: &SessionCore,
+        inputs: SummaryInputs,
+    ) -> SessionSummary {
+        // The one summary composer: the roster feed, `get_state`, and list rows
+        // all serve it, so the live flags never drift between surfaces.
+        let mut summary = session_summary(core, inputs);
+        // The roster-delta counter at snapshot time: the pull gate orders the
+        // summary against its watermark, so a delta still in flight when the pull
+        // answered is dropped instead of overwriting the pull's fresher state.
+        summary.roster_delta_sequence = Some(
+            self.roster_delta_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        summary.worker_instance_id = (!self.config.worker_instance_id.is_empty())
+            .then(|| self.config.worker_instance_id.clone());
+        summary
+    }
+
+    pub(crate) fn snapshot_locked(core: &SessionCore) -> SessionActionSnapshot {
+        session_snapshot(core)
+    }
+
+    /// Push one roster delta from a command arm (the model/thinking
+    /// switches), so a switch reaches the subscribed roster surfaces
+    /// without a turn.
+    pub(crate) fn push_roster_delta(&self) {
+        self.roster_pushes.push();
+    }
+
+    pub(crate) fn connection_state_locked(
+        core: &SessionCore,
+        inputs: ConnectionStateInputs,
+    ) -> AgentConnectionState {
+        let store = core.store.as_ref();
+
+        AgentConnectionState {
+            is_streaming: core.busy,
+            is_compacting: core.compacting,
+            active_session_id: Some(core.active_session_id.clone()),
+            cwd: core.cwd.clone(),
+            model: inputs.model,
+            thinking_level: inputs.thinking_level,
+            // The ACTIVE tier: the preference clamped to the model's tier support.
+            service_tier: crate::setting_switches::service_tier_wire_name(
+                core.active_service_tier
+                    .unwrap_or(pa_types::ai::ServiceTier::Auto),
+            )
+            .to_string(),
+            // The resolved model's supported levels (TS `getSupportedThinkingLevels`):
+            // a non-reasoning model reports ["off"], which the client treats as no
+            // thinking surface.
+            available_thinking_levels: inputs.available_thinking_levels,
+            is_bash_running: inputs.is_bash_running,
+            retry_attempt: 0,
+            steering_mode: core.steering_mode.clone(),
+            follow_up_mode: core.follow_up_mode.clone(),
+            session_file: store.map(|s| s.path.to_string_lossy().to_string()),
+            session_id: store
+                .map(|s| s.session_id().to_string())
+                .unwrap_or_default(),
+            session_name: store.and_then(|s| s.session_name().map(str::to_string)),
+            session_dir: store
+                .and_then(|s| s.path.parent())
+                .map(|p| p.to_string_lossy().to_string()),
+            leaf_id: store.and_then(|s| s.leaf_id().map(str::to_string)),
+            auto_compaction_enabled: core.auto_compaction_enabled,
+            message_count: store.map_or(0, crate::session_store::SessionFile::message_count) as u32,
+            session_actions: session_snapshot(core),
+            compaction_count: store.map_or(0, |store| store.compaction_count() as u32),
+            goal: inputs.goal,
+            scoped_models: core.scoped_models.clone(),
+            active_tool_names: Vec::new(),
+            // TS `createAgentConnectionState` carries `contextUsage:
+            // session.getContextUsage()` in every attach snapshot, so
+            // the client's first frame reads the tray's context usage
+            // off the snapshot instead of blocking on a
+            // `get_session_stats` round-trip (TS fetches stats only
+            // after a turn or compaction settles). The same store walk
+            // `get_session_stats` serves, under the same core lock the
+            // attach already holds: `None` without a model context
+            // window, exactly like the stats response.
+            context_usage: store.and_then(|store| {
+                crate::session_stats::store_context_usage(store, inputs.model_context_window)
+            }),
+        }
+    }
+
+    /// Persist the queue lanes to the recovery journal. Call after
+    /// releasing the core lock: `record_recovery` takes the locks in
+    /// the opposite order.
+    pub(crate) fn persist_queue_snapshot(
+        &self,
+        active_session_id: &str,
+        suspended: bool,
+        lanes: &QueueLanes,
+    ) {
+        let mut guard = self.recovery.lock().unwrap();
+        let Some(journal) = guard.as_mut() else {
+            return;
+        };
+        let _ = journal.record_queue_snapshot(
+            active_session_id,
+            &lanes.steering,
+            &lanes.follow_up,
+            suspended,
+        );
+    }
+
+    /// One queue-lane recovery checkpoint: the lane snapshot and the
+    /// busy verdict ride one locked read.
+    pub(crate) fn checkpoint_queue(&self, checkpoint: QueueCheckpoint) {
+        checkpoint_queue_recovery(&self.recovery, &self.core, checkpoint);
+    }
+
+    pub(crate) fn record_recovery(&self, busy: bool, operation: &str) -> Result<()> {
+        let mut guard = self.recovery.lock().unwrap();
+        let Some(journal) = guard.as_mut() else {
+            return Ok(());
+        };
+        let core = self.core.lock().unwrap();
+        let store = core.store.as_ref();
+        journal.record(
+            &core.active_session_id,
+            store.map_or("", crate::session_store::SessionFile::session_id),
+            store
+                .map(|s| s.path.to_string_lossy().to_string())
+                .as_deref(),
+            busy,
+            operation,
+        )
+    }
+
+    /// Sequence and broadcast one `session_event` frame at the worker
+    /// level.
+    pub(crate) fn emit_worker_event(&self, event: Value) {
+        emit_worker_event_with(&self.core, &self.events, event);
+    }
+
+    /// Record one durable custom row and broadcast its `message_start`/`message_end`
+    /// pair (rows the session appends outside a turn).
+    pub(crate) fn emit_custom_row(&self, message: &Value) {
+        let mut core = self.core.lock().unwrap();
+        persist_custom_row(&mut core, message);
+        broadcast_custom_row_locked(&mut core, &self.events, message);
+    }
+
+    /// Sequence and broadcast one `session_event` for the queue projection.
+    pub(crate) fn emit_action_update(&self, snapshot: &SessionActionSnapshot) -> Result<()> {
+        let mut core = self.core.lock().unwrap();
+        // TS `_emitQueueUpdate`: an unchanged projection stays silent (an
+        // empty queue before and after a turn is not an update).
+        if core.last_action_snapshot.as_ref() == Some(snapshot) {
+            return Ok(());
+        }
+        core.last_action_snapshot = Some(snapshot.clone());
+        let sequence = core.last_event_sequence + 1;
+        core.last_event_sequence = sequence;
+        let meta = create_daemon_event_meta(
+            &core.active_session_id,
+            sequence,
+            None,
+            Some(&core.generation),
+        );
+        let outbound = DaemonOutbound::SessionEvent {
+            active_session_id: core.active_session_id.clone(),
+            event: json!({ "type": "session_action_update", "actions": snapshot }),
+            meta: Some(meta),
+            rest: Map::default(),
+        };
+        let payload = serde_json::to_vec(&outbound)?;
+        drop(core);
+        self.events.send(OutboundFrame::session_event(payload));
+        Ok(())
+    }
+
+    pub(crate) fn emit_session_closed(
+        &self,
+        active_session_id: &str,
+        reason: DaemonSessionClosedReason,
+    ) -> Result<()> {
+        let mut core = self.core.lock().unwrap();
+        let sequence = core.last_event_sequence + 1;
+        core.last_event_sequence = sequence;
+        let meta = create_daemon_event_meta(
+            &core.active_session_id,
+            sequence,
+            None,
+            Some(&core.generation),
+        );
+        let outbound = DaemonOutbound::SessionClosed {
+            active_session_id: active_session_id.to_string(),
+            reason,
+            meta: Some(meta),
+            rest: Map::default(),
+        };
+        let payload = serde_json::to_vec(&outbound)?;
+        drop(core);
+        self.events.send(OutboundFrame::session_event(payload));
+        Ok(())
+    }
+}
+
+/// The durable half of [`Worker::emit_custom_row`]: append one custom
+/// row's `custom_message` entry while the CALLER holds the `core` lock,
+/// so a row tied to another locked write (the rename's notice, whose
+/// `session_info` name write it must not interleave with under
+/// concurrent worker commands) lands inside the caller's own lock scope.
+/// The persist error is display-row policy shared by every caller: the
+/// row is advisory, so the failure is swallowed, never the caller's.
+pub(crate) fn persist_custom_row(
+    core: &mut std::sync::MutexGuard<'_, SessionCore>,
+    message: &Value,
+) {
+    if let Some(store) = core.store.as_mut() {
+        let _ = store.persist_entry(
+            "custom_message",
+            json!({
+                "customType": message.get("customType").cloned().unwrap_or(Value::Null),
+                "content": message.get("content").cloned().unwrap_or(Value::Null),
+                "display": message.get("display").cloned().unwrap_or(Value::Bool(true)),
+                "details": message.get("details").cloned().unwrap_or(Value::Null),
+            }),
+        );
+    }
+}
+
+/// Broadcast a persisted custom row without releasing its store lock: a
+/// compaction replacement cannot include the row before its live frames.
+pub(crate) fn broadcast_custom_row_locked(
+    core: &mut SessionCore,
+    events: &EventPump,
+    message: &Value,
+) {
+    for event_type in ["message_start", "message_end"] {
+        emit_worker_event_locked(
+            core,
+            events,
+            json!({ "type": event_type, "message": message }),
+        );
+    }
+}
+
+pub(crate) fn emit_worker_event_with(
+    core: &Arc<Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+    event: Value,
+) {
+    let mut core = core.lock().unwrap();
+    emit_worker_event_locked(&mut core, events, event);
+}
+
+/// Sequence and enqueue an event while its caller still owns the session store lock.
+pub(crate) fn emit_worker_event_locked(core: &mut SessionCore, events: &EventPump, event: Value) {
+    let sequence = core.last_event_sequence + 1;
+    core.last_event_sequence = sequence;
+    let meta = create_daemon_event_meta(
+        &core.active_session_id,
+        sequence,
+        None,
+        Some(&core.generation),
+    );
+    let active_session_id = core.active_session_id.clone();
+    let outbound = DaemonOutbound::SessionEvent {
+        active_session_id,
+        event,
+        meta: Some(meta),
+        rest: Map::default(),
+    };
+    let payload = serde_json::to_vec(&outbound).unwrap_or_default();
+    events.send(OutboundFrame::session_event(payload));
+}
+
+/// The worker's roster-delta push: the fresh summary rides the supervisor
+/// link, awaited by the single roster consumer, so at most one push request
+/// is in flight at a time. Every delta still carries the worker's monotonic
+/// counter: an authoritative pull stamps the same counter, and the
+/// stale-delta gate drops a push that raced a fresher pull (the refresh
+/// backstops both).
+pub(crate) struct RosterPushContext {
+    pub(crate) core: Arc<Mutex<SessionCore>>,
+    pub(crate) engine: std::sync::Arc<dyn SessionEngine>,
+    pub(crate) user_bash: std::sync::Arc<crate::user_bash::UserBash>,
+    pub(crate) roster_link: std::sync::Arc<crate::supervisor_link::SupervisorLink>,
+    pub(crate) worker_token: String,
+    pub(crate) worker_instance_id: String,
+    pub(crate) roster_delta_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+pub(crate) async fn push_roster_delta(context: &RosterPushContext) {
+    if std::env::var_os("PA_WORKER_DISABLE_ROSTER_PUSH").is_some() {
+        return;
+    }
+    if context.worker_token.is_empty() || context.roster_link.socket_path().as_os_str().is_empty() {
+        return;
+    }
+    // A pull may race this push, but both read the counter with their core
+    // snapshot held: an equal-counter pull was captured after this push.
+    let command = {
+        let (core, inputs) =
+            SummaryInputs::lock(&context.core, context.engine.as_ref(), &context.user_bash);
+        let mut summary = session_summary(&core, inputs);
+        // The embedded counter is the pre-stamp value: every sequence
+        // stamped before the snapshot is at or below it.
+        summary.roster_delta_sequence = Some(
+            context
+                .roster_delta_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        summary.worker_instance_id = Some(context.worker_instance_id.clone());
+        let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+        let sequence_value = context
+            .roster_delta_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        serde_json::json!({
+            "type": "worker_roster_delta",
+            "workerToken": context.worker_token,
+            "summary": summary,
+            "sequence": sequence_value,
+            "workerInstanceId": context.worker_instance_id,
+        })
+    };
+    let _ = context
+        .roster_link
+        .request(command, std::time::Duration::from_secs(10))
+        .await;
+}
+
+/// Registry-derived values are resolved before taking the core lock, then
+/// checked against the cheap live selection under that lock. A model switch
+/// between the resolve and lock makes the caller retry, not ship a torn row.
+#[derive(Clone, Copy)]
+enum ModelDetailScope {
+    Summary,
+    Connection,
+}
+
+struct ModelDetails {
+    identity: (Option<String>, Option<String>),
+    model: Option<Value>,
+    available_thinking_levels: Option<Vec<String>>,
+    model_context_window: Option<u64>,
+}
+
+impl ModelDetails {
+    fn read(engine: &dyn SessionEngine, scope: ModelDetailScope) -> Self {
+        loop {
+            let identity = engine.model_identity();
+            let model = engine.model_metadata();
+            let (available_thinking_levels, model_context_window) = match scope {
+                ModelDetailScope::Summary => (None, None),
+                ModelDetailScope::Connection => (
+                    engine.supported_thinking_levels(),
+                    engine.model_context_window(),
+                ),
+            };
+            // Warm the engine's cached effective level while no core guard is
+            // held: an uncached level may also resolve the model registry.
+            let _ = engine.effective_thinking_level();
+            if engine.model_identity() == identity {
+                return Self {
+                    identity,
+                    model,
+                    available_thinking_levels,
+                    model_context_window,
+                };
+            }
+        }
+    }
+}
+
+/// Engine and user-bash values captured under the same core lock as the
+/// summary, after validating the registry-derived model against its selection.
+pub(crate) struct SummaryInputs {
+    pub(crate) thinking_level: String,
+    pub(crate) model: Option<Value>,
+    pub(crate) model_fallback_message: Option<String>,
+    pub(crate) bash_running: bool,
+    pub(crate) background_bash: bool,
+    pub(crate) quota_parked: bool,
+    pub(crate) subagents_running: bool,
+    pub(crate) progress_note: Option<String>,
+}
+
+impl SummaryInputs {
+    fn lock<'a>(
+        core: &'a Mutex<SessionCore>,
+        engine: &dyn SessionEngine,
+        user_bash: &crate::user_bash::UserBash,
+    ) -> (std::sync::MutexGuard<'a, SessionCore>, Self) {
+        loop {
+            let details = ModelDetails::read(engine, ModelDetailScope::Summary);
+            let core = core.lock().unwrap();
+            if engine.model_identity() == details.identity {
+                let identity = details.identity;
+                let inputs = Self::capture(engine, user_bash, details.model);
+                if engine.model_identity() == identity {
+                    return (core, inputs);
+                }
+            }
+        }
+    }
+
+    fn capture(
+        engine: &dyn SessionEngine,
+        user_bash: &crate::user_bash::UserBash,
+        model: Option<Value>,
+    ) -> Self {
+        Self {
+            thinking_level: engine
+                .effective_thinking_level()
+                .unwrap_or_else(|| "default".to_string()),
+            model,
+            model_fallback_message: engine.model_fallback_message(),
+            bash_running: user_bash.is_running(),
+            background_bash: engine.has_background_bash(),
+            quota_parked: engine.is_quota_parked(),
+            subagents_running: engine.has_running_subagents(),
+            progress_note: engine.progress_note(),
+        }
+    }
+}
+
+/// The connection state's engine/user-bash values, captured alongside its
+/// core state; registry-derived values resolve before the lock.
+pub(crate) struct ConnectionStateInputs {
+    model: Option<Value>,
+    thinking_level: String,
+    available_thinking_levels: Vec<String>,
+    is_bash_running: bool,
+    goal: Value,
+    model_context_window: Option<u64>,
+}
+
+impl ConnectionStateInputs {
+    fn lock<'a>(
+        core: &'a Mutex<SessionCore>,
+        engine: &dyn SessionEngine,
+        user_bash: &crate::user_bash::UserBash,
+    ) -> (std::sync::MutexGuard<'a, SessionCore>, Self) {
+        loop {
+            let details = ModelDetails::read(engine, ModelDetailScope::Connection);
+            let core = core.lock().unwrap();
+            if engine.model_identity() == details.identity {
+                let identity = details.identity.clone();
+                let inputs = Self::capture(engine, user_bash, details);
+                if engine.model_identity() == identity {
+                    return (core, inputs);
+                }
+            }
+        }
+    }
+
+    fn capture(
+        engine: &dyn SessionEngine,
+        user_bash: &crate::user_bash::UserBash,
+        details: ModelDetails,
+    ) -> Self {
+        Self {
+            model: details.model,
+            thinking_level: engine
+                .effective_thinking_level()
+                .unwrap_or_else(|| "default".to_string()),
+            available_thinking_levels: details
+                .available_thinking_levels
+                .unwrap_or_else(|| vec!["off".to_string()]),
+            is_bash_running: user_bash.is_running(),
+            goal: engine.goal_state_value(),
+            model_context_window: details.model_context_window,
+        }
+    }
+}
+
+pub(crate) fn session_summary(core: &SessionCore, inputs: SummaryInputs) -> SessionSummary {
+    let store = core.store.as_ref();
+    let streaming = core.busy;
+    let compacting = core.compacting;
+    let queued = core.steering.len() + core.follow_up.len();
+    // `modified` is the session file mtime; `lastActivityAt` prefers the
+    // newest message timestamp (port of `summaryForActiveSession`).
+    let modified = store
+        .and_then(|store| std::fs::metadata(&store.path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|time| {
+            crate::util::iso_from_unix_ms(
+                time.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default(),
+            )
+        });
+    // The scalars derive from one borrowed walk of the same windowed
+    // sequence `SessionFile::messages` folds, so the summary never
+    // materializes the retained transcript.
+    let scalars = store
+        .map(crate::session_store::SessionFile::scan_message_scalars)
+        .unwrap_or_default();
+    let last_activity_at = scalars
+        .last_timestamp_ms
+        .map(crate::util::iso_from_unix_ms)
+        .or_else(|| modified.clone())
+        .or_else(|| store.map(|store| store.header.timestamp.clone()));
+    // Usage: the whole-file own-usage fold (TS `getOwnUsageSummary`);
+    // a pathless store folds its in-memory entries.
+    let usage = store
+        .and_then(|store| {
+            if store.path.as_os_str().is_empty() {
+                crate::session_usage::own_usage_summary_of(store.entries())
+            } else {
+                crate::session_store::read_session_info(&store.path).and_then(|info| info.usage)
+            }
+        })
+        .map(|usage| json!(usage));
+    SessionSummary {
+        id: core.active_session_id.clone(),
+        lifecycle: active_lifecycle(&core.runtime_kind, scalars.message_count == 0, streaming)
+            .to_string(),
+        // Running children keep the session working after its own turn
+        // ended: every status surface classifies this activity.
+        activity: if streaming || compacting || inputs.subagents_running {
+            "working"
+        } else {
+            "idle"
+        }
+        .to_string(),
+        is_session_active: streaming || compacting || queued > 0,
+        has_registered_cron_job: Some(false),
+        last_activity_at,
+        rlm_depth: Some(core.rlm_depth),
+        active_session_id: Some(core.active_session_id.clone()),
+        session_id: store
+            .map(|s| s.session_id().to_string())
+            .unwrap_or_default(),
+        session_file: store.map(|s| s.path.to_string_lossy().to_string()),
+        session_name: store.and_then(|s| s.session_name().map(str::to_string)),
+        cwd: core.cwd.clone(),
+        thinking_level: Some(inputs.thinking_level),
+        is_streaming: streaming,
+        is_compacting: compacting,
+        is_quota_parked: Some(inputs.quota_parked),
+        is_bash_running: Some(inputs.bash_running),
+        has_background_bash: inputs.background_bash,
+        is_running_tools: streaming && !core.running_tool_calls.is_empty(),
+        has_running_subagents: inputs.subagents_running,
+        attached_clients: core.attached_client_ids.len() as u32,
+        message_count: store.map_or(0, crate::session_store::SessionFile::message_count) as u32,
+        session_actions: session_snapshot(core),
+        streaming_message: None,
+        created: store.map(|s| s.header.timestamp.clone()),
+        modified,
+        first_message: store.and_then(crate::session_store::SessionFile::first_message),
+        progress_note: inputs.progress_note,
+        tool_use_count: (core.tool_use_count > 0).then_some(core.tool_use_count),
+        parent_session_path: store.and_then(|store| store.header.parent_session.clone()),
+        parent_active_session_id: core.parent_active_session_id.clone(),
+        parent_session_id: core.parent_session_id.clone(),
+        rlm_child_id: core.rlm_child_id.clone(),
+        usage,
+        worker_state: Some("ready".to_string()),
+        worker_pid: Some(std::process::id()),
+        // Set by the caller when the snapshot backs a roster push; authoritative
+        // pulls embed the live counter in `summary_locked` instead.
+        roster_delta_sequence: None,
+        worker_instance_id: None,
+        model: inputs.model,
+        model_fallback_message: inputs.model_fallback_message,
+        runtime_kind: Some(core.runtime_kind.clone()),
+        unfinished_action_count: Some(0),
+        anthropic_warning_shown: store
+            .map(crate::session_store::SessionFile::anthropic_warning_shown),
+    }
+}
+
+/// One lane's indices: the parked items matching the classifier, by
+/// lane index.
+fn indices(
+    items: &std::collections::VecDeque<QueuedItem>,
+    classified: impl Fn(&QueuedItem) -> bool,
+) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| classified(item))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The queue snapshot for one core (TS `sessionActions`).
+pub(crate) fn session_snapshot(core: &SessionCore) -> SessionActionSnapshot {
+    // A parked row reads the labeled preview when it carries one,
+    // else the message text.
+    let lane = |items: &std::collections::VecDeque<QueuedItem>| {
+        items
+            .iter()
+            .map(|item| item.preview.clone().unwrap_or_else(|| item.message.clone()))
+            .collect::<Vec<String>>()
+    };
+    // The RLM child status notices fold by TYPED provenance: a user-typed message
+    // that merely looks like a notice preview never marks.
+    let rlm_child_status =
+        |items: &std::collections::VecDeque<QueuedItem>| indices(items, is_rlm_child_status_item);
+    // The engine-minted continuations fold by their own typed provenance: Rust
+    // keeps them visible as the strip's counted row (operator directive
+    // 2026-09-28), unlike TS's filtered-out projection.
+    let injected_prompts =
+        |items: &std::collections::VecDeque<QueuedItem>| indices(items, is_injected_prompt_item);
+    SessionActionSnapshot {
+        queued_count: (core.steering.len() + core.follow_up.len()) as u32,
+        steering: lane(&core.steering),
+        follow_ups: lane(&core.follow_up),
+        rlm_child_status: crate::types::QueueLaneIndices {
+            steering: rlm_child_status(&core.steering),
+            follow_up: rlm_child_status(&core.follow_up),
+        },
+        injected_prompts: crate::types::QueueLaneIndices {
+            steering: injected_prompts(&core.steering),
+            follow_up: injected_prompts(&core.follow_up),
+        },
+        active: core.active_action.clone(),
+    }
+}
+
+/// The active action's queue label (TS `compactRlmText(text, 160)`):
+/// collapse whitespace and cap at 160 chars with an ellipsis.
+pub(crate) fn compact_action_label(text: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        return compact;
+    }
+    let kept: String = compact.chars().take(MAX_CHARS - 3).collect();
+    format!("{}...", kept.trim_end())
+}

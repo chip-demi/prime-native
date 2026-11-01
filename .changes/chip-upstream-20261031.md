@@ -1,0 +1,1 @@
+- Preserve managed work permissions and durable receipts across graceful shutdown while integrating upstream factory, child working-directory and runtime improvements.

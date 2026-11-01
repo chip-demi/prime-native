@@ -1,0 +1,188 @@
+//! The successor supervisor seam (spec §4 `Booting`): spawn the new (or
+//! rollback) binary from its release dir, pass the roster through the one
+//! env the boot sweep reads, and wait for the `daemon_hello` that carries
+//! the successor identity.
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use pa_types::daemon::update_flow::{UpdateProcessIdentity, UPDATE_ROSTER_ENV};
+use serde_json::Value;
+
+/// How often the boot wait retries the hello handshake.
+const BOOT_POLL: Duration = Duration::from_millis(250);
+
+/// The identity a `daemon_hello` frame carries (TS `processIdentityFromDaemonHello`): pid, start
+/// id, generation, and owner token.
+pub fn identity_from_hello(hello: &Value) -> UpdateProcessIdentity {
+    UpdateProcessIdentity {
+        pid: hello
+            .get("supervisorPid")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        process_start_id: hello
+            .get("supervisorProcessStartId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        supervisor_generation: hello
+            .get("supervisorGeneration")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        supervisor_owner_token: hello
+            .get("supervisorOwnerToken")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// Spawn the successor supervisor detached (the roster path is the one
+/// addition, spec §6); the binary entry strips any inherited worker env.
+///
+/// # Errors
+/// Returns an error when the successor supervisor cannot be spawned.
+pub fn spawn_supervisor(
+    exe: &Path,
+    socket_path: &Path,
+    roster_path: Option<&Path>,
+    cwd: &Path,
+) -> Result<u64> {
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["--mode", "daemon", "--daemon-socket"])
+        .arg(socket_path)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(roster_path) = roster_path {
+        command.env(UPDATE_ROSTER_ENV, roster_path);
+    }
+    #[cfg(unix)]
+    pa_core::platform::process::set_new_session(&mut command);
+    #[cfg(not(unix))]
+    pa_core::platform::process::set_new_process_group(&mut command);
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawn the successor supervisor from {}", exe.display()))?;
+    Ok(u64::from(child.id()))
+}
+
+/// Connect and complete the `daemon_hello` handshake, bounded by `budget_ms`
+/// (spec §9 `Booting`): `true` identity on hello, `false` on budget expiry.
+pub async fn wait_for_hello(socket_path: &Path, budget_ms: u64) -> Option<UpdateProcessIdentity> {
+    let deadline = Instant::now() + Duration::from_millis(budget_ms.max(1));
+    loop {
+        if let Ok((client, _events)) =
+            pa_tui::daemon_client::DaemonClient::connect(socket_path).await
+        {
+            let identity = identity_from_hello(client.hello());
+            client.close();
+            return Some(identity);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        // The retry poll never steps past the budget: a silent socket is waited
+        // out to the deadline (TS `waitForHello` bounds the whole wait).
+        tokio::time::sleep(BOOT_POLL.min(deadline - now)).await;
+    }
+}
+
+/// Wait for a process identity to leave the process table (spec §9 `Stopped`: the fence-free pid +
+/// start-id poll).
+pub async fn wait_for_exit(identity: &UpdateProcessIdentity, budget_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(budget_ms.max(1));
+    loop {
+        let Ok(pid) = u32::try_from(identity.pid) else {
+            return false;
+        };
+        if process_exit_observed(
+            pa_daemon::lease::is_process_alive(pid).ok(),
+            identity.process_start_id.as_deref(),
+            pa_daemon::lease::get_process_start_id(pid).as_deref(),
+        ) {
+            return true;
+        }
+        if Instant::now() + BOOT_POLL >= deadline {
+            return false;
+        }
+        tokio::time::sleep(BOOT_POLL).await;
+    }
+}
+
+/// Only a known-dead PID or an observed different birth identity proves exit.
+fn process_exit_observed(
+    alive: Option<bool>,
+    expected: Option<&str>,
+    observed: Option<&str>,
+) -> bool {
+    alive == Some(false)
+        || matches!((alive, expected, observed), (Some(true), Some(expected), Some(observed)) if expected != observed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unknown_process_probes_do_not_prove_predecessor_exit() {
+        assert!(!process_exit_observed(None, Some("birth"), None));
+        assert!(!process_exit_observed(Some(true), Some("birth"), None));
+        assert!(!process_exit_observed(Some(true), None, Some("birth")));
+        assert!(!process_exit_observed(
+            Some(true),
+            Some("birth"),
+            Some("birth")
+        ));
+        assert!(process_exit_observed(Some(false), Some("birth"), None));
+        assert!(process_exit_observed(
+            Some(true),
+            Some("birth"),
+            Some("new-birth")
+        ));
+    }
+
+    #[test]
+    fn identity_maps_the_hello_frame_fields() {
+        let identity = identity_from_hello(&json!({
+            "supervisorPid": 42,
+            "supervisorProcessStartId": "42/7",
+            "supervisorGeneration": "sup:42",
+            "supervisorOwnerToken": "tok",
+        }));
+        assert_eq!(identity.pid, 42);
+        assert_eq!(identity.process_start_id.as_deref(), Some("42/7"));
+        assert_eq!(identity.supervisor_generation.as_deref(), Some("sup:42"));
+        assert_eq!(identity.supervisor_owner_token.as_deref(), Some("tok"));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_dead_identity_returns_immediately() {
+        let identity = UpdateProcessIdentity {
+            pid: 4_000_000,
+            process_start_id: None,
+            supervisor_generation: None,
+            supervisor_owner_token: None,
+            rest: serde_json::Map::default(),
+        };
+        assert!(wait_for_exit(&identity, 1_000).await);
+    }
+
+    #[tokio::test]
+    async fn hello_wait_times_out_on_a_silent_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket: PathBuf = dir.path().join("silent.sock");
+        let started = Instant::now();
+        // The budget spans at least one poll: the loop gives up when the next
+        // poll would overshoot, so the elapsed time is poll-granular.
+        let identity = wait_for_hello(&socket, (BOOT_POLL * 2).as_millis() as u64).await;
+        assert!(identity.is_none());
+        assert!(started.elapsed() >= BOOT_POLL);
+    }
+}

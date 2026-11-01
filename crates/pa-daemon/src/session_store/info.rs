@@ -1,0 +1,1002 @@
+//! The per-file info scan: the resumable listing fold — the generation
+//! identity, the LRU-bounded scan-state cache, the resumed line fold over
+//! raw spans, the derived `SessionInfo`, and the most-recent-session
+//! lookup.
+
+use super::{
+    fs, info_sidecar, list_sessions, normalize_state_status, Cow, Deserialize, HashMap, Path,
+    PathBuf, Serialize, SessionHeader, Usage, Value,
+};
+
+/// The durable metadata the daemon list surfaces for one session file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub id: String,
+    pub cwd: String,
+    pub name: Option<String>,
+    pub state: Option<String>,
+    pub model: Option<(String, String)>,
+    /// The last persisted `thinking_level_change` level; agents-view summaries
+    /// surface it for sessions without a live worker.
+    pub thinking_level: Option<String>,
+    pub parent_session_path: Option<String>,
+    pub rlm_depth: u32,
+    pub created: String,
+    pub modified: String,
+    pub message_count: usize,
+    pub first_message: String,
+    /// The own-usage summary — assistant aggregates plus summarization calls,
+    /// minus every attributed child block; `None` when the session recorded no billable work.
+    pub usage: Option<crate::session_usage::SessionUsageSummary>,
+    /// The recursive spend of ledger-tombstoned descendants, attached by the
+    /// catalog's listing arm from the spawn ledger. Never set by the file
+    /// scan: ledger-derived, not transcript-derived.
+    pub deleted_descendant_usage: Option<crate::session_usage::SessionUsageSummary>,
+}
+
+/// The scan's read-buffer size: one 64 KiB fill reads the typical session in
+/// a single syscall; only the syscall chunking changes.
+const SESSION_SCAN_READ_BUF_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct SessionInfoGeneration {
+    pub(super) len: u64,
+    pub(super) dev: u64,
+    pub(super) ino: u64,
+    pub(super) mtime: i64,
+    pub(super) mtime_ns: i64,
+    pub(super) ctime: i64,
+    pub(super) ctime_ns: i64,
+}
+
+impl SessionInfoGeneration {
+    /// A recent ctime can alias a same-size rewrite within one filesystem tick.
+    /// Supported Unix filesystems must advance ctime within one second; the HEL1
+    /// ext4 fixture reproduces identical nanosecond stat values after real rewrites.
+    /// A future ctime (including clock rollback) or unsupported stamp never certifies.
+    fn is_settled_at(&self, now: std::time::SystemTime) -> bool {
+        let Ok(seconds) = u64::try_from(self.ctime) else {
+            return false;
+        };
+        let Ok(nanos) = u32::try_from(self.ctime_ns) else {
+            return false;
+        };
+        if !cfg!(unix) || nanos >= 1_000_000_000 {
+            return false;
+        }
+        let Some(stamp) =
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(seconds, nanos))
+        else {
+            return false;
+        };
+        now.duration_since(stamp)
+            .is_ok_and(|age| age >= std::time::Duration::from_secs(1))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn from_metadata(meta: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: meta.len(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_ns: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_ns: meta.ctime_nsec(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn from_metadata(meta: &fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            dev: 0,
+            ino: 0,
+            mtime: 0,
+            mtime_ns: 0,
+            ctime: 0,
+            ctime_ns: 0,
+        }
+    }
+}
+
+/// The cross-file memory budget on retained assistant usage records and
+/// stable attribution IDs: keeps large families resident without unbounded retry history.
+const SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES: usize = 400_000;
+
+/// The cached-state count ceiling: the cap must sit well ABOVE a catalog
+/// refresh's working set — a cap inside it would evict mid-walk and thrash
+/// every pass into a full rescan. Eviction stays LRU-first.
+pub(super) const SESSION_SCAN_MAX_CACHED_STATES: usize = 4096;
+
+/// The states map with its insertion order (JS Map iteration order — LRU
+/// eviction walks from the front) and the retained-usage-entry counter.
+#[derive(Default)]
+pub(super) struct SessionInfoScanCache {
+    pub(super) states: HashMap<PathBuf, SessionScanState>,
+    /// Oldest first; one ordinal per live state keeps the recency index bounded across indefinite
+    /// refreshes.
+    pub(super) order: std::collections::BTreeMap<u64, PathBuf>,
+    pub(super) ordinal_by_path: HashMap<PathBuf, u64>,
+    pub(super) next_ordinal: u64,
+    retained_usage_entries: usize,
+}
+
+impl SessionInfoScanCache {
+    pub(super) fn drop_state(&mut self, path: &Path) {
+        if let Some(state) = self.states.remove(path) {
+            self.retained_usage_entries -= state.accounted_usage_entries;
+        }
+        if let Some(ordinal) = self.ordinal_by_path.remove(path) {
+            self.order.remove(&ordinal);
+        }
+    }
+
+    fn mark_recent(&mut self, path: &Path) {
+        if let Some(ordinal) = self.ordinal_by_path.remove(path) {
+            self.order.remove(&ordinal);
+        }
+        // Rollover is unreachable in practice, but rebuilding the tiny
+        // (at most 4096 entries) recency index preserves exact LRU order.
+        if self.next_ordinal == u64::MAX {
+            let ordered: Vec<PathBuf> = self.order.values().cloned().collect();
+            self.order.clear();
+            self.ordinal_by_path.clear();
+            for (ordinal, old_path) in ordered.into_iter().enumerate() {
+                let ordinal = ordinal as u64;
+                self.ordinal_by_path.insert(old_path.clone(), ordinal);
+                self.order.insert(ordinal, old_path);
+            }
+            self.next_ordinal = self.order.len() as u64;
+        }
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        self.ordinal_by_path.insert(path.to_path_buf(), ordinal);
+        self.order.insert(ordinal, path.to_path_buf());
+    }
+
+    /// LRU recency without re-accounting.
+    pub(super) fn touch(&mut self, path: &Path) {
+        if self.states.contains_key(path) {
+            self.mark_recent(path);
+        }
+    }
+
+    /// (Re-)store with fresh accounting, then evict insertion-order-first states until the budget
+    /// holds.
+    pub(super) fn store_state(&mut self, path: &Path, state: SessionScanState) {
+        self.drop_state(path);
+        let mut state = state;
+        state.accounted_usage_entries = state.acc.usage_scan.retained_entries();
+        self.retained_usage_entries += state.accounted_usage_entries;
+        self.states.insert(path.to_path_buf(), state);
+        self.mark_recent(path);
+        while self.retained_usage_entries > SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES
+            || self.states.len() > SESSION_SCAN_MAX_CACHED_STATES
+        {
+            let Some((_, front)) = self.order.first_key_value() else {
+                break;
+            };
+            let front = front.clone();
+            self.drop_state(&front);
+        }
+    }
+}
+
+pub(super) fn session_info_cache() -> &'static std::sync::Mutex<SessionInfoScanCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<SessionInfoScanCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(SessionInfoScanCache::default()))
+}
+
+/// The trailing window of the consumed prefix a resumed scan verifies before
+/// trusting the cached fold: a same-identity, same-size rewrite is the aliasing risk.
+pub(super) const SESSION_SCAN_RESUME_TAIL_BYTES: usize = 16;
+
+/// TS `SessionScanAccumulator`: the per-file fold state a resume continues
+/// from. The finished [`SessionInfo`] is derived from this; the cached state
+/// carries the accumulator so a grown file folds ONLY its appended entries.
+/// Clone is the snapshot fold's copy (TS `snapshotSessionInfo`). Serialize is
+/// the persisted sidecar's form ([`super::info_sidecar`]): a released lease
+/// holder writes it, a cold process loads it and folds only the tail.
+/// Persisted in `<stem>.info-cache.json`: see
+/// `info_sidecar::INFO_SIDECAR_VERSION` for the version-bump rule.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(super) struct SessionScanAccumulator {
+    header: Option<SessionHeader>,
+    name: Option<String>,
+    state: Option<String>,
+    model: Option<(String, String)>,
+    thinking_level: Option<String>,
+    pub(super) message_count: usize,
+    pub(super) first_message: String,
+    last_activity_ms: Option<u64>,
+    usage_scan: crate::session_usage::UsageScan,
+}
+
+/// One cached scan state (TS `SessionScanState`): the generation the state
+/// was certified at, the fold accumulator, the consumed-prefix cursor, the
+/// resume tail, and the derived info. Serialize is the persisted sidecar's
+/// form: `info` and the retained-usage accounting are skipped (the load
+/// rebuilds the row through the fold and `store_state` recounts).
+#[derive(Serialize, Deserialize)]
+pub(super) struct SessionScanState {
+    generation: SessionInfoGeneration,
+    // This snapshot was validated after its ctime alias window closed. Merely
+    // aging a previously cached generation must never promote stale content.
+    #[serde(default)]
+    settled_generation: bool,
+    pub(super) acc: SessionScanAccumulator,
+    /// Bytes consumed through the end of the last complete line.
+    offset: u64,
+    pub(super) tail: [u8; SESSION_SCAN_RESUME_TAIL_BYTES],
+    #[serde(skip)]
+    info: Option<SessionInfo>,
+    /// Usage entries counted against the retained bound at the last store
+    /// (TS `accountedUsageEntries`).
+    #[serde(skip)]
+    accounted_usage_entries: usize,
+}
+
+impl SessionScanState {
+    pub(super) fn fresh(generation: SessionInfoGeneration) -> Self {
+        Self {
+            generation,
+            settled_generation: false,
+            acc: SessionScanAccumulator::default(),
+            offset: 0,
+            tail: [b'\n'; SESSION_SCAN_RESUME_TAIL_BYTES],
+            info: None,
+            accounted_usage_entries: 0,
+        }
+    }
+
+    /// The resume copy: the fold state travels, the derived info does not
+    /// (the appended entries rebuild it).
+    pub(super) fn clone_for_resume(&self) -> Self {
+        Self {
+            generation: self.generation,
+            settled_generation: self.settled_generation,
+            acc: SessionScanAccumulator {
+                header: self.acc.header.clone(),
+                name: self.acc.name.clone(),
+                state: self.acc.state.clone(),
+                model: self.acc.model.clone(),
+                thinking_level: self.acc.thinking_level.clone(),
+                message_count: self.acc.message_count,
+                first_message: self.acc.first_message.clone(),
+                last_activity_ms: self.acc.last_activity_ms,
+                usage_scan: self.acc.usage_scan.clone(),
+            },
+            offset: self.offset,
+            tail: self.tail,
+            info: None,
+            accounted_usage_entries: 0,
+        }
+    }
+
+    /// TS `seedRosterLedger`-side identity: the resume requires the same
+    /// file (dev/ino) with a grown-or-equal length (the grown-or-equal
+    /// length check itself lives at the call sites; this predicate is the
+    /// same-file part only).
+    // The unix arm reads `self.generation`; the not-unix arm carries no
+    // dev/ino identity at all, so it always answers false (every grown
+    // file rescans whole - see the arm's own comment).
+    #[cfg_attr(not(unix), allow(clippy::unused_self))]
+    fn same_file_identity(
+        &self,
+        #[cfg_attr(not(unix), allow(unused_variables))] generation: &SessionInfoGeneration,
+    ) -> bool {
+        #[cfg(unix)]
+        {
+            self.generation.dev == generation.dev && self.generation.ino == generation.ino
+        }
+        // No dev/ino from std on this platform: every grown file rescans
+        // whole (TS always has dev/ino); an mtime identity would instead
+        // certify an in-place rewrite as a resume.
+        #[cfg(not(unix))]
+        {
+            let _ = generation;
+            false
+        }
+    }
+
+    /// The consumed prefix's trailing window: a long line keeps only its
+    /// last bytes plus the newline; a short line rolls into the previous window.
+    pub(super) fn advance_tail(&mut self, line: &[u8]) {
+        let keep = SESSION_SCAN_RESUME_TAIL_BYTES - 1;
+        if line.len() >= keep {
+            self.tail[..keep].copy_from_slice(&line[line.len() - keep..]);
+            self.tail[keep] = b'\n';
+        } else {
+            let shift = line.len() + 1;
+            self.tail.copy_within(shift.., 0);
+            let at = SESSION_SCAN_RESUME_TAIL_BYTES - shift;
+            self.tail[at..keep].copy_from_slice(line);
+            self.tail[keep] = b'\n';
+        }
+    }
+
+    /// The bytes just before the cursor match the cached window, proving the
+    /// resume starts where the cached fold left off: a torn write or a
+    /// rewrite that raced the scan is caught here.
+    fn prefix_intact(&self, file: &fs::File) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        if self.offset == 0 {
+            return true;
+        }
+        let window = SESSION_SCAN_RESUME_TAIL_BYTES as u64;
+        let start = self.offset.saturating_sub(window);
+        let len = (self.offset - start) as usize;
+        let mut read_back = vec![0u8; len];
+        let mut cursor = file;
+        if cursor.seek(SeekFrom::Start(start)).is_err() {
+            return false;
+        }
+        if cursor.read_exact(&mut read_back).is_err() {
+            return false;
+        }
+        read_back.as_slice() == &self.tail[self.tail.len() - len..]
+    }
+}
+
+/// Message metadata only: fields ride as borrowed raw spans (zero copy, no
+/// materialization), so a row re-parses only the spans its arm touches.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SessionInfoMessage<'a> {
+    #[serde(default, borrow)]
+    pub(super) role: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) provider: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) model: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) timestamp: Option<&'a serde_json::value::RawValue>,
+    /// The lenient scan-side shape ([`crate::session_usage::ScanUsage`]):
+    /// a partial persisted block must not reject the row.
+    #[serde(default)]
+    usage: Option<crate::session_usage::ScanUsage>,
+    /// Borrowed `content` span (zero copy): read only when the fold's guard passes.
+    #[serde(default, borrow)]
+    pub(super) content: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SessionInfoEntry<'a> {
+    #[serde(borrow, rename = "type")]
+    pub(super) type_: Cow<'a, str>,
+    #[serde(borrow, rename = "id")]
+    pub(super) id: Cow<'a, str>,
+    #[serde(borrow, rename = "timestamp")]
+    pub(super) _timestamp: Cow<'a, str>,
+    #[serde(borrow, default, rename = "parentId")]
+    pub(super) _parent_id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    pub(super) name: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) state: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) provider: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) model_id: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) thinking_level: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow)]
+    pub(super) message: Option<SessionInfoMessage<'a>>,
+    /// `child_usage_attributed`: the parent entry the aggregate folds into.
+    #[serde(borrow, default)]
+    pub(super) target_id: Option<Cow<'a, str>>,
+    #[serde(default)]
+    child_usage: Option<crate::session_usage::ScanUsage>,
+    #[serde(default)]
+    aggregate_usage: Option<crate::session_usage::ScanUsage>,
+    /// `compaction`/`branch_summary`: the summarization call's own usage.
+    #[serde(default)]
+    usage: Option<crate::session_usage::ScanUsage>,
+}
+
+/// Read a session file's list metadata: unchanged files answer from the cache,
+/// grown files fold ONLY their appended entries, rewritten files rescan from the top.
+#[must_use]
+pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
+    let mut file = fs::File::open(path).ok()?;
+    read_session_info_from(&mut file, path).map(|(info, _)| info)
+}
+
+/// [`read_session_info`] over an already-open handle: the roster gate shares
+/// one open with the fold (the gate reads the first line, the fold rewinds).
+/// The flag is true when no in-process state served and the persisted sidecar
+/// did not cover the whole file (absent, unloadable, or behind): the fold read
+/// bytes a sidecar would have spared.
+pub(crate) fn read_session_info_from(
+    file: &mut fs::File,
+    path: &Path,
+) -> Option<(SessionInfo, bool)> {
+    read_session_info_from_at(file, path, std::time::SystemTime::now())
+}
+
+fn read_session_info_from_at(
+    file: &mut fs::File,
+    path: &Path,
+    validation_time: std::time::SystemTime,
+) -> Option<(SessionInfo, bool)> {
+    let generation = SessionInfoGeneration::from_metadata(&file.metadata().ok()?);
+    let settled_generation = generation.is_settled_at(validation_time);
+
+    // The unchanged case answers from the cache; the grown case resumes.
+    let state = {
+        let mut cache = session_info_cache().lock().ok()?;
+        match cache.states.get(path) {
+            Some(cached)
+                if cached.generation == generation
+                    && cached.settled_generation
+                    && settled_generation =>
+            {
+                let info = cached.info.clone();
+                cache.touch(path);
+                return info.map(|info| (info, false));
+            }
+            Some(cached)
+                if cached.same_file_identity(&generation)
+                    && generation.len > cached.generation.len =>
+            {
+                if cached.prefix_intact(file) {
+                    Some(cached.clone_for_resume())
+                } else {
+                    None
+                }
+            }
+            // No in-process state serves (absent or invalidated): the
+            // persisted sidecar below decides, outside the lock (its
+            // load is file IO).
+            _ => None,
+        }
+    };
+    let (mut state, sidecar_behind) = match state {
+        Some(state) => (state, false),
+        None => {
+            // A previous lease holder's certified fold state, loaded from
+            // the sidecar. It passes the same validation ladder a cached
+            // state passes, minus the derived-info shortcut (a loaded
+            // state carries none): an equal generation folds zero bytes
+            // and rebuilds the row, a grown same-inode file with an
+            // intact prefix folds its appended entries, and anything
+            // else is the cold scan the sidecar-less path always ran.
+            match info_sidecar::load(path) {
+                Some(cached)
+                    if cached.generation == generation
+                        && cached.settled_generation
+                        && settled_generation =>
+                {
+                    (cached, false)
+                }
+                Some(cached)
+                    if cached.same_file_identity(&generation)
+                        && generation.len > cached.generation.len
+                        && cached.prefix_intact(file) =>
+                {
+                    (cached, true)
+                }
+                _ => (SessionScanState::fresh(generation), true),
+            }
+        }
+    };
+    // Position the shared cursor at the resume point: `prefix_intact` leaves
+    // the cursor at the old consumed end, so a fresh state must rewind to byte 0.
+    if std::io::Seek::seek(file, std::io::SeekFrom::Start(state.offset)).is_err() {
+        return None;
+    }
+    let torn_tail = {
+        let mut reader = std::io::BufReader::with_capacity(SESSION_SCAN_READ_BUF_BYTES, &mut *file);
+        state.scan_from_cursor(&mut reader, generation.len)?
+    };
+    // The durable last-resort value for `modified`, read lazily: `None` keeps
+    // unavailable (unreadable, pre-epoch) metadata distinct from a real epoch timestamp.
+    let stats_mtime_ms = || {
+        file.metadata().ok().and_then(|meta| {
+            meta.modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+        })
+    };
+    let info = state.build_info(path, stats_mtime_ms, Some(&torn_tail))?;
+    // A concurrent append/replacement must never certify stale metadata;
+    // records without message timestamps never certify either.
+    let modified_ms = state.acc.last_activity_ms.unwrap_or(0);
+    if cfg!(unix)
+        && modified_ms > 0
+        && file
+            .metadata()
+            .is_ok_and(|meta| SessionInfoGeneration::from_metadata(&meta) == generation)
+        && fs::metadata(path)
+            .is_ok_and(|meta| SessionInfoGeneration::from_metadata(&meta) == generation)
+    {
+        state.generation = generation;
+        state.settled_generation = settled_generation;
+        state.info = Some(info.clone());
+        if let Ok(mut cache) = session_info_cache().lock() {
+            cache.store_state(path, state);
+        }
+    }
+    Some((info, sidecar_behind))
+}
+
+impl SessionScanState {
+    /// Fold lines from the cursor: a complete line advances the cursor and
+    /// the tail; an unterminated final line is never consumed (it may be an
+    /// in-progress append) and is returned as the torn tail. `None` = the abort arm.
+    fn scan_from_cursor(
+        &mut self,
+        reader: &mut std::io::BufReader<&mut fs::File>,
+        size: u64,
+    ) -> Option<String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let consumed = std::io::BufRead::read_line(reader, &mut line).ok()?;
+            if consumed == 0 {
+                break;
+            }
+            let complete = line.ends_with('\n');
+            if !complete && (self.offset + consumed as u64) >= size {
+                // A torn trailing line: the cursor stays put so the completed
+                // line folds on the next scan.
+                return Some(line);
+            }
+            if complete {
+                line.pop();
+            }
+            fold_scan_entry(&mut self.acc, &line)?;
+            self.offset += consumed as u64;
+            self.advance_tail(line.as_bytes());
+            if !complete {
+                break;
+            }
+        }
+        Some(String::new())
+    }
+
+    /// Derive the listing row. A non-empty torn tail folds into a SNAPSHOT
+    /// copy of the accumulator: the valid unterminated final line reaches
+    /// the row while the resumable state stays untouched.
+    pub(super) fn build_info(
+        &self,
+        path: &Path,
+        stats_mtime_ms: impl FnOnce() -> Option<u64>,
+        torn: Option<&str>,
+    ) -> Option<SessionInfo> {
+        let snapshot;
+        let acc = match torn.filter(|tail| !tail.trim().is_empty()) {
+            Some(tail) => {
+                let mut snap = self.acc.clone();
+                fold_scan_entry(&mut snap, tail)?;
+                snapshot = snap;
+                &snapshot
+            }
+            None => &self.acc,
+        };
+        let usage = acc.usage_scan.summary();
+        let header = acc.header.as_ref()?;
+        // The newest user/assistant message timestamp, then the header's
+        // creation timestamp, then the file's mtime — never scan time; only
+        // the message arm filters zero (missing entry timestamps stamp 0).
+        let modified_ms = acc
+            .last_activity_ms
+            .filter(|ms| *ms > 0)
+            .or_else(|| crate::util::iso_to_unix_ms(&header.timestamp))
+            .or_else(stats_mtime_ms);
+        let modified = modified_ms
+            .map(crate::util::iso_from_unix_ms)
+            .unwrap_or_default();
+        Some(SessionInfo {
+            path: path.to_path_buf(),
+            id: header.id.clone(),
+            cwd: header.cwd.clone(),
+            name: acc.name.clone(),
+            state: acc.state.clone(),
+            model: acc.model.clone(),
+            thinking_level: acc.thinking_level.clone(),
+            parent_session_path: header.parent_session.clone(),
+            rlm_depth: header.rlm_depth.unwrap_or(0) as u32,
+            created: header.timestamp.clone(),
+            modified,
+            message_count: acc.message_count,
+            first_message: if acc.first_message.is_empty() {
+                "(no messages)".to_string()
+            } else {
+                acc.first_message.clone()
+            },
+            usage,
+            // Ledger-derived, never the file scan's: the listing arm attaches it from the ledger.
+            deleted_descendant_usage: None,
+        })
+    }
+}
+
+/// The text fold of one message's `content` from the borrowed raw span
+/// (parsing it back yields the identical `Value`, no second whole-line walk).
+/// `None` content and an unparsable span both read as empty text.
+pub(super) fn message_content_text(content: Option<&serde_json::value::RawValue>) -> String {
+    content
+        .map(|raw| {
+            crate::types::content_to_text(
+                &serde_json::from_str::<Value>(raw.get()).unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Read a borrowed raw span the way the owned-`Value` fold read it: `Some`
+/// only when the field is present and a JSON string.
+pub(super) fn raw_string(raw: Option<&serde_json::value::RawValue>) -> Option<Cow<'_, str>> {
+    serde_json::from_str(raw?.get()).ok()
+}
+
+/// `Value::as_u64` over a borrowed raw span: `Some` only when the field is
+/// present and a JSON number a `u64` parses.
+pub(super) fn raw_u64(raw: Option<&serde_json::value::RawValue>) -> Option<u64> {
+    serde_json::from_str(raw?.get()).ok()
+}
+
+/// Fold one complete line into the scan state; `None` = the abort arm (a
+/// `model_change` without its model identity).
+pub(super) fn fold_scan_entry(acc: &mut SessionScanAccumulator, raw: &str) -> Option<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(());
+    }
+    let Ok(entry) = serde_json::from_str::<SessionInfoEntry>(trimmed) else {
+        return Some(());
+    };
+    match entry.type_.as_ref() {
+        "session" => {
+            let parsed: SessionHeader = serde_json::from_str(trimmed).ok()?;
+            acc.header = Some(parsed);
+        }
+        "session_info" => {
+            acc.name = raw_string(entry.name)
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string);
+        }
+        "session_state" => {
+            if let Some(status) = entry
+                .state
+                .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok())
+                .as_ref()
+                .and_then(|s| s.get("status"))
+                .and_then(Value::as_str)
+            {
+                acc.state = Some(normalize_state_status(status));
+            }
+        }
+        "model_change" => {
+            acc.model = Some((
+                raw_string(entry.provider)?.into_owned(),
+                raw_string(entry.model_id)?.into_owned(),
+            ));
+        }
+        "thinking_level_change" => {
+            if let Some(level) = raw_string(entry.thinking_level)
+                .as_deref()
+                .map(str::trim)
+                .filter(|level| !level.is_empty())
+            {
+                acc.thinking_level = Some(level.to_string());
+            }
+        }
+        "child_usage_attributed" => {
+            acc.usage_scan.fold_child_attribution(
+                &entry.id,
+                entry.target_id.as_deref(),
+                entry.child_usage.map(Usage::from),
+                entry.aggregate_usage.map(Usage::from),
+            );
+        }
+        "compaction" | "branch_summary" => {
+            acc.usage_scan
+                .fold_summarization(entry.usage.map(Usage::from));
+        }
+        "message" => {
+            acc.message_count += 1;
+            if let Some(message) = entry.message {
+                let role = raw_string(message.role);
+                let role = role.as_deref();
+                acc.usage_scan
+                    .fold_message(&entry.id, role, message.usage.map(Usage::from));
+                if role == Some("assistant") {
+                    if let (Some(provider), Some(model_id)) =
+                        (raw_string(message.provider), raw_string(message.model))
+                    {
+                        acc.model = Some((provider.to_string(), model_id.to_string()));
+                    }
+                }
+                if matches!(role, Some("user" | "assistant")) {
+                    if let Some(timestamp) = raw_u64(message.timestamp) {
+                        acc.last_activity_ms =
+                            Some(acc.last_activity_ms.unwrap_or(0).max(timestamp));
+                    }
+                }
+                if role == Some("user") && acc.first_message.is_empty() {
+                    let text = message_content_text(message.content);
+                    if !text.is_empty() {
+                        acc.first_message.clone_from(&text);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// Most recent valid session for a cwd.
+#[must_use]
+pub fn find_most_recent_session_for_cwd(session_dir: &Path, cwd: &str) -> Option<PathBuf> {
+    list_sessions(session_dir)
+        .into_iter()
+        .find(|info| {
+            !info.cwd.is_empty()
+                && Path::new(&info.cwd).canonicalize().map_or_else(
+                    |_| info.cwd == cwd,
+                    |p| {
+                        p == Path::new(cwd)
+                            .canonicalize()
+                            .unwrap_or_else(|_| PathBuf::from(cwd))
+                    },
+                )
+        })
+        .map(|info| info.path)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cached_prefix_resume_subtracts_a_duplicate_attribution_once() {
+        use std::io::{BufReader, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isolated-prefix.jsonl");
+        let assistant = r#"{"type":"message","id":"a","timestamp":"2026-10-11T00:00:00.000Z","message":{"role":"assistant","timestamp":1790110000000,"usage":{"input":100,"output":10,"totalTokens":110}}}"#;
+        let attribution = r#"{"type":"child_usage_attributed","id":"report","timestamp":"2026-10-11T00:00:00.000Z","targetId":"a","childUsage":{"input":20,"output":2,"totalTokens":22},"aggregateUsage":{"input":120,"output":12,"totalTokens":132}}"#;
+        for row in [assistant, attribution] {
+            serde_json::from_str::<SessionInfoEntry<'_>>(row).unwrap();
+        }
+        let prefix = format!("{assistant}\n{attribution}\n");
+        fs::write(&path, &prefix).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let generation = SessionInfoGeneration::from_metadata(&file.metadata().unwrap());
+        let mut state = SessionScanState::fresh(generation);
+        state
+            .scan_from_cursor(&mut BufReader::new(&mut file), generation.len)
+            .unwrap();
+        assert_eq!(state.offset, generation.len);
+        let expected = state.acc.usage_scan.totals();
+        let mut cache = SessionInfoScanCache::default();
+        cache.store_state(&path, state);
+        let cached = cache.states.get(&path).unwrap().clone_for_resume();
+        let mut resumed: SessionScanState =
+            serde_json::from_slice(&serde_json::to_vec(&cached).unwrap()).unwrap();
+        {
+            let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(append, "{attribution}").unwrap();
+        }
+        let grown_len = file.metadata().unwrap().len();
+        assert!(grown_len > cached.offset);
+        file.seek(SeekFrom::Start(resumed.offset)).unwrap();
+        resumed
+            .scan_from_cursor(&mut BufReader::new(&mut file), grown_len)
+            .unwrap();
+        assert_eq!(resumed.offset, grown_len);
+        assert_eq!(resumed.acc.usage_scan.totals(), expected);
+        assert_eq!(resumed.acc.usage_scan.retained_entries(), 2);
+        drop(file);
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn attribution_ids_share_the_retained_usage_budget_and_trigger_lru_eviction() {
+        let generation = SessionInfoGeneration {
+            len: 0,
+            dev: 0,
+            ino: 0,
+            mtime: 0,
+            mtime_ns: 0,
+            ctime: 0,
+            ctime_ns: 0,
+        };
+        let mut cache = SessionInfoScanCache::default();
+        let old_path = Path::new("old.jsonl");
+        let new_path = Path::new("new.jsonl");
+        let mut old = SessionScanState::fresh(generation);
+        old.acc
+            .usage_scan
+            .fold_message("assistant", Some("assistant"), Some(Usage::default()));
+        for index in 1..SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES {
+            let row = format!(
+                r#"{{"type":"child_usage_attributed","id":"report-{index}","timestamp":"2026-10-11T00:00:00.000Z","targetId":"assistant","childUsage":{{}},"aggregateUsage":{{}}}}"#
+            );
+            serde_json::from_str::<SessionInfoEntry<'_>>(&row).unwrap();
+            fold_scan_entry(&mut old.acc, &row).unwrap();
+        }
+        cache.store_state(old_path, old);
+        assert_eq!(
+            cache.retained_usage_entries,
+            SESSION_SCAN_MAX_RETAINED_USAGE_ENTRIES
+        );
+        let mut new = SessionScanState::fresh(generation);
+        new.acc
+            .usage_scan
+            .fold_message("assistant", Some("assistant"), Some(Usage::default()));
+        fold_scan_entry(&mut new.acc, r#"{"type":"child_usage_attributed","id":"new-report","timestamp":"2026-10-11T00:00:00.000Z","targetId":"assistant","childUsage":{},"aggregateUsage":{}}"#).unwrap();
+        cache.store_state(new_path, new);
+        assert_eq!(
+            cache.states.keys().cloned().collect::<Vec<_>>(),
+            vec![new_path.to_path_buf()]
+        );
+        assert_eq!(cache.retained_usage_entries, 2);
+        assert_eq!(
+            cache.order.values().cloned().collect::<Vec<_>>(),
+            vec![new_path.to_path_buf()]
+        );
+        assert_eq!(cache.ordinal_by_path.len(), 1);
+        cache.drop_state(new_path);
+        assert!(cache.states.is_empty());
+        assert_eq!(cache.retained_usage_entries, 0);
+        assert!(cache.order.is_empty());
+        assert!(cache.ordinal_by_path.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_alias_rewrite_rejects_memory_and_sidecar_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alias.jsonl");
+        let original = concat!(
+            "{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-09-23T00:00:00.000Z\",\"cwd\":\"/test\"}\n",
+            "{\"type\":\"session_info\",\"id\":\"n\",\"timestamp\":\"2026-09-23T00:00:00.000Z\",\"name\":\"bravo\"}\n",
+            "{\"type\":\"message\",\"id\":\"m\",\"timestamp\":\"2026-09-23T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"start\",\"timestamp\":1790110000000}}\n"
+        );
+        fs::write(&path, original).unwrap();
+        assert_eq!(
+            read_session_info(&path).unwrap().name.as_deref(),
+            Some("bravo")
+        );
+        fs::write(&path, original.replace("bravo", "delta")).unwrap();
+        // Force the metadata alias deterministically, independently of clock resolution.
+        let generation = SessionInfoGeneration::from_metadata(&fs::metadata(&path).unwrap());
+        {
+            let mut cache = session_info_cache().lock().unwrap();
+            cache.states.get_mut(&path).unwrap().generation = generation;
+        }
+        info_sidecar::persist_info_sidecar(&path);
+        assert_eq!(
+            read_session_info(&path).unwrap().name.as_deref(),
+            Some("delta")
+        );
+        // Reinstall the stale certified state as a sidecar-only alias too.
+        fs::write(&path, original).unwrap();
+        assert_eq!(
+            read_session_info(&path).unwrap().name.as_deref(),
+            Some("bravo")
+        );
+        fs::write(&path, original.replace("bravo", "delta")).unwrap();
+        {
+            let mut cache = session_info_cache().lock().unwrap();
+            cache.states.get_mut(&path).unwrap().generation =
+                SessionInfoGeneration::from_metadata(&fs::metadata(&path).unwrap());
+        }
+        info_sidecar::persist_info_sidecar(&path);
+        session_info_cache().lock().unwrap().drop_state(&path);
+        assert_eq!(
+            read_session_info(&path).unwrap().name.as_deref(),
+            Some("delta")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_reuse_requires_settled_valid_ctime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ctime.jsonl");
+        fs::write(&path, "{}\n").unwrap();
+        let mut generation = SessionInfoGeneration::from_metadata(&fs::metadata(&path).unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        generation.ctime = i64::try_from(now.as_secs() + 60).unwrap();
+        assert!(
+            !generation.is_settled_at(std::time::SystemTime::now()),
+            "future/rollback stamps never certify"
+        );
+        generation.ctime = 0;
+        generation.ctime_ns = 0;
+        assert!(
+            generation.is_settled_at(std::time::SystemTime::now()),
+            "quiet history retains metadata-only reuse"
+        );
+        generation.ctime_ns = 1_000_000_000;
+        assert!(
+            !generation.is_settled_at(std::time::SystemTime::now()),
+            "invalid nanos never certify"
+        );
+        generation.ctime = -1;
+        generation.ctime_ns = 0;
+        assert!(
+            !generation.is_settled_at(std::time::SystemTime::now()),
+            "unsupported/pre-epoch stamps never certify"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_alias_lookup_cold_validates_memory_and_sidecar_before_certifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delayed-alias.jsonl");
+        let original = concat!(
+            "{\"type\":\"session\",\"id\":\"s\",\"timestamp\":\"2026-09-23T00:00:00.000Z\",\"cwd\":\"/test\"}\n",
+            "{\"type\":\"session_info\",\"id\":\"n\",\"timestamp\":\"2026-09-23T00:00:00.000Z\",\"name\":\"bravo\"}\n",
+            "{\"type\":\"message\",\"id\":\"m\",\"timestamp\":\"2026-09-23T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"start\",\"timestamp\":1790110000000}}\n"
+        );
+        for sidecar_only in [false, true] {
+            fs::write(&path, original).unwrap();
+            let mut file = fs::File::open(&path).unwrap();
+            let stamp = SessionInfoGeneration::from_metadata(&file.metadata().unwrap());
+            let fresh = std::time::UNIX_EPOCH
+                + std::time::Duration::new(
+                    u64::try_from(stamp.ctime).unwrap(),
+                    u32::try_from(stamp.ctime_ns).unwrap(),
+                );
+            assert_eq!(
+                read_session_info_from_at(&mut file, &path, fresh)
+                    .unwrap()
+                    .0
+                    .name
+                    .as_deref(),
+                Some("bravo")
+            );
+            assert!(!session_info_cache().lock().unwrap().states[&path].settled_generation);
+            fs::write(&path, original.replace("bravo", "delta")).unwrap();
+            let generation = SessionInfoGeneration::from_metadata(&fs::metadata(&path).unwrap());
+            {
+                let mut cache = session_info_cache().lock().unwrap();
+                cache.states.get_mut(&path).unwrap().generation = generation;
+            }
+            if sidecar_only {
+                info_sidecar::persist_info_sidecar(&path);
+                session_info_cache().lock().unwrap().drop_state(&path);
+            }
+            let settled = std::time::UNIX_EPOCH
+                + std::time::Duration::new(
+                    u64::try_from(generation.ctime).unwrap(),
+                    u32::try_from(generation.ctime_ns).unwrap(),
+                )
+                + std::time::Duration::from_secs(2);
+            assert!(generation.is_settled_at(settled));
+            let mut file = fs::File::open(&path).unwrap();
+            let (observed, cold) = read_session_info_from_at(&mut file, &path, settled).unwrap();
+            assert_eq!(observed.name.as_deref(), Some("delta"));
+            assert!(
+                cold,
+                "aging an uncertified snapshot must not bless its old fold"
+            );
+            assert!(session_info_cache().lock().unwrap().states[&path].settled_generation);
+            let mut file = fs::File::open(&path).unwrap();
+            let (observed, cold) = read_session_info_from_at(&mut file, &path, settled).unwrap();
+            assert_eq!(observed.name.as_deref(), Some("delta"));
+            assert!(
+                !cold,
+                "the validated quiet generation retains its fast path"
+            );
+            session_info_cache().lock().unwrap().drop_state(&path);
+        }
+    }
+}

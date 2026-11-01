@@ -1,0 +1,1 @@
+Native daemon preserves Studio request and session model behavior: opt-in `PRIME_STUDIO_CONTEXT_HYGIENE=1` abbreviates long Python namespace notices only in provider context, while image-routed turns persist a return-to-primary model marker for resumed sessions.

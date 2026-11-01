@@ -1,0 +1,1004 @@
+//! Session lifecycle on the worker: shutdown, replacement handoff,
+//! resume, compaction triggers, and the wait-for-settled arms.
+use super::{
+    json, queue_lanes, response_failure, response_success, session_snapshot, AgentSessionEngine,
+    DaemonResponse, QueueCheckpoint, QueuePriority, QueuedItem, SessionFile, TurnPolicy, Value,
+    Worker, SIDE_QUESTION_SETTLE_TIMEOUT,
+};
+use crate::goal_continuation::HeadlessGoalWait;
+
+impl Worker {
+    /// `update_snapshot` (supervisor plane, update flow spec §8): a read-only
+    /// capture; the queue lanes persist BEFORE replying, so the reported queue
+    /// and the durable respawn state agree (`busy` is the continuation signal).
+    pub(crate) fn handle_update_snapshot(&self) -> DaemonResponse {
+        let (core_data, lanes, suspended) = {
+            let core = self.core.lock().unwrap();
+            let recovery = self.recovery.lock().unwrap();
+            if let Some(reason) =
+                super::update_admission::snapshot_blocker(&core, recovery.as_ref())
+            {
+                return response_failure(None, "update_snapshot", reason, None);
+            }
+            let store = core.store.as_ref();
+            let data = json!({
+                "activeSessionId": core.active_session_id,
+                "sessionId": store.map(crate::session_store::SessionFile::session_id).unwrap_or_default(),
+                "sessionFile": core
+                    .store
+                    .as_ref()
+                    .map(|s| s.path.to_string_lossy().to_string()),
+                "cwd": core.cwd,
+                "generation": core.generation,
+                "runtimeMetadata": {
+                    "kind": core.runtime_kind,
+                    "rlmChildId": core.rlm_child_id,
+                    "parentSessionId": core.parent_session_id,
+                    "rlmDepth": core.rlm_depth,
+                },
+                "queue": {
+                    "actions": serde_json::to_value(session_snapshot(&core)).ok(),
+                    "steering": core.steering.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
+                    "followUps": core.follow_up.iter().map(|item| item.message.clone()).collect::<Vec<_>>(),
+                },
+                "busy": core.busy,
+                "compacting": core.compacting,
+            });
+            (data, queue_lanes(&core), core.queued_input_suspended)
+        };
+        // Journal the lanes after releasing the core lock (record paths take
+        // the locks in the opposite order).
+        self.persist_queue_snapshot(
+            core_data["activeSessionId"].as_str().unwrap_or_default(),
+            suspended,
+            &lanes,
+        );
+        response_success(None, "update_snapshot", Some(core_data))
+    }
+
+    pub(crate) fn release_session_lease(&self) {
+        let lease = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .and_then(|store| store.lease.take());
+        drop(lease);
+    }
+
+    pub(crate) async fn handle_shutdown(&self, payload: &Value) -> DaemonResponse {
+        let daemon_wide = payload.get("daemonShutdown").and_then(Value::as_bool) == Some(true);
+        // The session is closing: the continuation mint sites and their
+        // settle-hook retries bail, but unlike a kill the close KEEPS the
+        // resume entry — the scheduled jobs survive for the later wake.
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.mark_session_closed();
+        }
+        // Abort the side questions before anything else closes: otherwise the
+        // reattached client's pane wedges on a turn no event will ever settle.
+        eprintln!(
+            "shutdown_phase phase=side_questions stage=started worker={}",
+            self.config.active_session_id
+        );
+        self.side_questions
+            .abort_all_and_settle(SIDE_QUESTION_SETTLE_TIMEOUT)
+            .await;
+        eprintln!(
+            "shutdown_phase phase=side_questions stage=completed worker={}",
+            self.config.active_session_id
+        );
+        let interrupted_turn = {
+            let mut core = self.core.lock().unwrap();
+            // Every explicit cancellation also sets `abort_requested`.
+            let interrupted_turn = core.busy && !core.abort_requested && !core.turn_completed;
+            // The shutdown gate closes FIRST: a racing execute_bash must see the
+            // stop before the abort runs — a claim that slipped in after the
+            // abort would register a controller nothing later cancels, and the
+            // exit leaves its child running.
+            core.shutdown_requested = true;
+            core.abort_requested = true;
+            interrupted_turn
+        };
+        // The running user bash goes with the stop: the passivation stop must
+        // never leave the user's process running after the worker exits. Each
+        // run kills its tree in its own task, so the stop waits (bounded) for
+        // the runs to settle (TS `abortBashForClose`).
+        eprintln!(
+            "shutdown_phase phase=user_bash stage=started worker={}",
+            self.config.active_session_id
+        );
+        self.user_bash.abort_and_settle().await;
+        eprintln!(
+            "shutdown_phase phase=user_bash stage=completed worker={}",
+            self.config.active_session_id
+        );
+        // TS `shutdown` closes through `session.abort()` -> `requestAbort()`:
+        // the in-flight turn's fetch cancels now, not at its next event.
+        self.engine.abort_in_flight_turn();
+        self.work_notify.notify_one();
+        // The settle + teardown must happen before the exit this reply unlocks:
+        // `std::process` exit runs no destructors, so an undisposed kernel
+        // would be orphaned (the #235 leak class).
+        self.compaction.abort();
+        self.tree_navigation.abort();
+        eprintln!(
+            "shutdown_phase phase=session_work stage=started worker={}",
+            self.config.active_session_id
+        );
+        self.await_session_work_settled().await;
+        eprintln!(
+            "shutdown_phase phase=session_work stage=completed worker={}",
+            self.config.active_session_id
+        );
+        // Parent-owned children settle through the parent's ledger on restart.
+        // Neither an interrupted task nor its unaccepted input may mint a fresh
+        // autonomous run before that reconciliation. Retain the input as parked
+        // evidence; an explicit later admission owns any new child work.
+        {
+            let mut core = self.core.lock().unwrap();
+            if core.runtime_kind == "subagent"
+                && ((interrupted_turn && !core.turn_completed && !core.turn_cancelled)
+                    || !core.steering.is_empty()
+                    || !core.follow_up.is_empty())
+            {
+                core.queued_input_suspended = true;
+            }
+        }
+        // A daemon-wide shutdown that interrupted a running turn queues the
+        // continuation prompt so the next boot resumes the turn.
+        let continue_turn = daemon_wide && interrupted_turn && {
+            let mut core = self.core.lock().unwrap();
+            // A managed delivery parks at settle when shutdown interrupts it. Its
+            // consumed admission must be reconciled, not replaced with plain input.
+            let still_interrupted =
+                !core.turn_cancelled && !core.turn_completed && !core.queued_input_suspended;
+            if still_interrupted {
+                core.steering.push_front(QueuedItem {
+                    priority: QueuePriority::Human,
+                    preview: None,
+                    message: crate::update_restore::UPDATE_RESTART_CONTINUATION_PROMPT.to_string(),
+                    custom_message: None,
+                    agent_message: None,
+                    queue_key: None,
+                    admission_id: None,
+                    input_identity: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: false,
+                    policy: TurnPolicy::Direct,
+                    forced_batch: false,
+                });
+            }
+            still_interrupted
+        };
+        if continue_turn {
+            self.checkpoint_queue(QueueCheckpoint::Admitted {
+                operation: "prompt_accepted",
+            });
+        }
+        // The children close before the exit (an unreachable child must not
+        // block the worker's own exit); their resume entries and scheduled
+        // jobs survive.
+        eprintln!(
+            "shutdown_phase phase=children stage=started worker={}",
+            self.config.active_session_id
+        );
+        if let Err(error) = self
+            .close_rlm_children(crate::rlm_children::ChildCloseReason::Shutdown)
+            .await
+        {
+            eprintln!("pa-daemon: RLM child close at shutdown failed: {error:#}");
+        }
+        eprintln!(
+            "shutdown_phase phase=children stage=completed worker={}",
+            self.config.active_session_id
+        );
+        if let Some(agent_engine) = &self.agent_engine {
+            eprintln!(
+                "shutdown_phase phase=kernel stage=started worker={}",
+                self.config.active_session_id
+            );
+            agent_engine.dispose_kernel().await;
+            eprintln!(
+                "shutdown_phase phase=kernel stage=completed worker={}",
+                self.config.active_session_id
+            );
+        }
+        eprintln!(
+            "shutdown_phase phase=telemetry stage=started worker={}",
+            self.config.active_session_id
+        );
+        self.engine.end_telemetry().await;
+        eprintln!(
+            "shutdown_phase phase=telemetry stage=completed worker={}",
+            self.config.active_session_id
+        );
+        self.release_session_lease();
+        // The worker's quit (TS `session_shutdown` reason `quit`): the
+        // pane reporter releases its pane as the last write on the wire
+        // — awaited here so the release lands before this reply unlocks
+        // the process exit, and no late report reclaims the pane.
+        let reporter = self.herdr.lock().unwrap().clone();
+        eprintln!(
+            "shutdown_phase phase=pane_release stage=started worker={}",
+            self.config.active_session_id
+        );
+        reporter.release().await;
+        eprintln!(
+            "shutdown_phase phase=pane_release stage=completed worker={}",
+            self.config.active_session_id
+        );
+        // The verdict is durable BEFORE the reply: the supervisor may escalate
+        // the stop as soon as the reply lands. Parked (suspended) lanes are not
+        // busy: they wait for an explicit resume.
+        let busy = {
+            let core = self.core.lock().unwrap();
+            !core.queued_input_suspended
+                && (!core.steering.is_empty() || !core.follow_up.is_empty())
+        };
+        let _ = self.record_recovery(busy, "shutdown");
+        response_success(None, "shutdown", None)
+    }
+
+    /// Wait until no turn or compaction run is in flight: the kernel dispose
+    /// must never race a live run. The caller requests the aborts first.
+    pub(crate) async fn await_session_work_settled(&self) {
+        loop {
+            // Register the permit before the flag check: a run settling between
+            // the two still wakes this waiter (`notify_waiters` reaches
+            // registered futures).
+            let notified = self.idle_notify.notified();
+            {
+                let core = self.core.lock().unwrap();
+                if !core.busy && !core.compacting {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// The whole-runtime replacement flows retire the live session before
+    /// swapping onto the replacement file: the queued actions cancel, the runs
+    /// abort and settle, then the runtime retires and the RLM children close.
+    /// Tree moves never run this (the kernel stays warm).
+    pub(crate) async fn teardown_for_replacement(&self) -> anyhow::Result<()> {
+        // Mark the session closed before the children close: the marker keeps
+        // settle retries from minting continuations into the retiring session.
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.mark_session_closed();
+        }
+        {
+            let mut core = self.core.lock().unwrap();
+            core.steering.clear();
+            core.follow_up.clear();
+        }
+        self.compaction.abort();
+        self.tree_navigation.abort();
+        self.await_replacement_settled().await;
+        self.engine.teardown_for_replacement().await;
+        // A close failure rethrows out of the teardown: the
+        // replacement fails with the old runtime already retired.
+        self.close_rlm_children(crate::rlm_children::ChildCloseReason::Replaced)
+            .await
+    }
+
+    /// Close this session's supervisor-backed RLM children: every runtime
+    /// teardown that ends the session runs it, cascading to grandchildren
+    /// through each child worker's own close with the same reason.
+    pub(crate) async fn close_rlm_children(
+        &self,
+        reason: crate::rlm_children::ChildCloseReason,
+    ) -> anyhow::Result<()> {
+        let children = self
+            .agent_engine
+            .as_ref()
+            .and_then(|engine| engine.children.clone());
+        match children {
+            Some(children) => children.close_children(reason).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Relist the bound session's ledger children (TS
+    /// `listPassiveRlmSubagents`): awaited where the identity is bound -
+    /// create, and the replacement rebind inside the gate - so the scan is
+    /// ordered with the close walk that follows a later replacement.
+    pub(crate) async fn reseed_rlm_children(&self) {
+        if let Some(children) = self
+            .agent_engine
+            .as_ref()
+            .and_then(|engine| engine.children.clone())
+        {
+            children.reseed_from_ledger().await;
+        }
+    }
+
+    /// Wait until the replacement teardown can retire the runtime: no
+    /// turn and no compaction in flight. Like the navigation settle, the
+    /// park rides a timeout backstop - the turn runner notifies the idle
+    /// notify when a run settles, but a compaction settle does not, so a
+    /// missed wake must not hang the replacement.
+    async fn await_replacement_settled(&self) {
+        loop {
+            let busy = {
+                let mut core = self.core.lock().unwrap();
+                let busy = core.busy || core.compacting;
+                if busy {
+                    core.abort_requested = true;
+                    core.turn_cancelled = true;
+                }
+                busy
+            };
+            if !busy {
+                return;
+            }
+            // The engine abort cancels the in-flight fetch, so the
+            // settle does not wait out a pending provider response.
+            self.engine.abort_in_flight_turn();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                self.idle_notify.notified(),
+            )
+            .await;
+        }
+    }
+
+    /// The fresh session builds in the background, so the replacement session's
+    /// kernel prewarm fires at the replacement, not at the first turn; the
+    /// build gate deduplicates it against any racing demand seam.
+    pub(crate) fn prewarm_replacement_session(&self) {
+        if let Some(agent_engine) = &self.agent_engine {
+            let engine = std::sync::Arc::clone(agent_engine);
+            tokio::spawn(async move {
+                let Ok(model) = engine.resolve_model() else {
+                    return;
+                };
+                let _ = engine.ensure_core_session_async(&model).await;
+            });
+        }
+    }
+
+    /// Rebind the worker onto the replacement session's cwd: the core's cwd
+    /// and the engine's cwd slot move onto the target's recorded directory
+    /// (nothing old observes the move).
+    pub(crate) fn rebind_worker_cwd(&self, cwd: &str) {
+        {
+            let mut core = self
+                .core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            core.cwd = cwd.to_string();
+        }
+        self.engine.set_cwd(std::path::PathBuf::from(cwd));
+    }
+
+    /// Refresh the replacement session's derived state (TS
+    /// `refreshReplacedSessionState` on the `sessionReplaced` event): the
+    /// moved-to session's depth re-seeds the worker core and the engine's
+    /// RLM identity (a resumed subagent keeps its persisted depth). The schedule
+    /// catalog rebind runs separately (`bind_scheduled_jobs`), like the
+    /// TS dispatch handlers that call `rebindCronJobsToState` after the
+    /// runtime call.
+    pub(crate) async fn refresh_replaced_session_state(&self) {
+        let (rlm_depth, summary, child_script) = {
+            let (mut core, inputs) = self.summary_inputs();
+            // The moved-to file's persisted depth wins (the replacement
+            // carries no create-config depth).
+            let rlm_depth = core
+                .store
+                .as_ref()
+                .and_then(SessionFile::rlm_depth)
+                .unwrap_or(0);
+            core.rlm_depth = rlm_depth;
+            let child_script = core.child_script.clone();
+            (rlm_depth, self.summary_locked(&core, inputs), child_script)
+        };
+        // No thinking flag rides the rebind (the create command's level is
+        // already resolved on the engine), and the TS replacement runtime
+        // carries no inherited max-depth: the moved-to session's persisted
+        // chat override, the global setting, the env, or the default
+        // resolve it (`_resolveRlmMaxDepth` precedence). The harness's
+        // child engine file rides along: TS children inherit the
+        // replacement runtime's `sessionConfig`, which the runtime keeps
+        // across its swaps.
+        match self
+            .engine
+            .configure_rlm_identity(crate::engine::RlmSessionIdentity {
+                rlm_depth,
+                rlm_max_depth: None,
+                cwd: Some(summary.cwd.clone()),
+                session_id: Some(summary.session_id.clone()),
+                session_file: summary.session_file.clone(),
+                thinking: None,
+                child_script,
+                // A TS replacement runtime has no semantic spawn.
+                semantic_spawn: None,
+                factory_child: false,
+            }) {
+            Ok(()) => self.reseed_rlm_children().await,
+            Err(error) => eprintln!("pa-daemon: replacement identity rebind failed: {error:#}"),
+        }
+        if let Ok(summary_value) = serde_json::to_value(&summary) {
+            self.engine.set_session_summary(summary_value);
+        }
+    }
+
+    /// Bind the live session's schedule catalog: register the artifact
+    /// partition, rebind the stored jobs onto the live ids, and start (or
+    /// wake) the scheduler. Runs at create and after every replacement swap.
+    pub(crate) async fn bind_scheduled_jobs(&self) -> anyhow::Result<()> {
+        let binding = {
+            let core = self
+                .core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::scheduled_jobs::live_binding(&core)
+        };
+        if let Some((binding, artifact_dir)) = binding {
+            self.scheduled.bind_session(binding, artifact_dir).await?;
+        }
+        Ok(())
+    }
+
+    /// `resume_queue`: the queue's queued work resumes (the turn runner
+    /// drains the lanes when idle); the failure string is TS-verbatim for the empty queue.
+    pub(crate) fn handle_resume_queue(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("resume_queue") {
+            return response;
+        }
+        let queued_at_transition = {
+            let mut recovery = self.recovery.lock().unwrap();
+            let mut core = self.core.lock().unwrap();
+            let has_queued_work = !core.steering.is_empty() || !core.follow_up.is_empty();
+            // Persist only the idle parked transition. Active turns have already
+            // picked their inputs out of these lanes; rewriting that snapshot
+            // could erase their original recovery evidence. An idle compaction
+            // picks nothing, so it checkpoints like any idle resume.
+            let checkpoint_idle_resume = core.queued_input_suspended && !core.busy;
+            if let (true, Some(journal)) = (checkpoint_idle_resume, recovery.as_mut()) {
+                let lanes = crate::worker::queue_lanes(&core);
+                let store = core.store.as_ref();
+                let session_file = store.map(|store| store.path.to_string_lossy().to_string());
+                // Keep pickup and cancellation blocked until this transition
+                // is durable; failure leaves the live suspension unchanged.
+                if let Err(error) = journal.record_queue_checkpoint(
+                    &core.active_session_id,
+                    store.map_or("", crate::session_store::SessionFile::session_id),
+                    session_file.as_deref(),
+                    has_queued_work,
+                    "queue_resumed",
+                    &lanes.steering,
+                    &lanes.follow_up,
+                    /*suspended*/ false,
+                ) {
+                    eprintln!("pa-daemon: queue resume checkpoint failed: {error:#}");
+                    return response_failure(
+                        None,
+                        "resume_queue",
+                        "Could not persist queue resume state",
+                        None,
+                    );
+                }
+            }
+            // Busy and already-resumed calls retain legacy behavior
+            // without replacing the saved admission snapshot.
+            core.queued_input_suspended = false;
+            has_queued_work
+        };
+        // Only effects run after unlock; a concurrent later abort must not have
+        // its suspension cleared again here.
+        self.wake_queued_input();
+        let has_queued_work = queued_at_transition || {
+            let core = self.core.lock().unwrap();
+            !core.steering.is_empty() || !core.follow_up.is_empty()
+        };
+        if !has_queued_work {
+            return response_failure(None, "resume_queue", "No queued work to resume", None);
+        }
+        response_success(None, "resume_queue", None)
+    }
+
+    /// Clear the queued-input suspension and wake the turn runner so parked
+    /// lanes drain; an owed continuation re-evaluates here too.
+    pub(crate) fn resume_queued_input(&self) {
+        {
+            let mut core = self.core.lock().unwrap();
+            if core.queued_input_suspended {
+                core.queued_input_suspended = false;
+            }
+        }
+        self.wake_queued_input();
+    }
+
+    /// Wake queued work and re-evaluate owed continuations without changing
+    /// the suspension gate.
+    pub(crate) fn wake_queued_input(&self) {
+        self.work_notify.notify_one();
+        if let Some(engine) = self.agent_engine.as_ref() {
+            engine.retry_owed_goal_continuation();
+        }
+    }
+
+    /// Run one compaction and answer with the TS `CompactionResult` wire shape;
+    /// skips, aborts, and failures answer with the session's error message.
+    pub(crate) async fn handle_compaction(&self, payload: &Value) -> DaemonResponse {
+        if let Err(response) = self.require_created("compact") {
+            return response;
+        }
+        let custom_instructions = payload
+            .get("customInstructions")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        {
+            // `compact()` aborts first, which suspends queued-input admission: the
+            // suspension outlives skip/failure/abort outcomes and is cleared below
+            // only for the didCompact + active-goal branch.
+            let mut core = self.core.lock().unwrap();
+            core.queued_input_suspended = true;
+        }
+        let outcome = self
+            .compaction
+            .run(custom_instructions, &self.idle_notify)
+            .await;
+        // The pump re-schedules on every outcome: a resume site that cleared the
+        // suspension MID-window left its item parked behind the compacting gate;
+        // without this wake the parked steer would strand forever.
+        self.work_notify.notify_one();
+        // Mint the owed goal continuation only when nothing is queued;
+        // the resume site below clears the suspension gate and wakes
+        // the runner (TS `compact()` goal branch).
+        let mut goal_continue_scheduled = false;
+        if let crate::engine::CompactionOutcome::Compacted { .. } = &outcome {
+            let goal_active = self
+                .engine
+                .goal_state_value()
+                .get("status")
+                .and_then(Value::as_str)
+                == Some("active");
+            if goal_active {
+                let has_queued = {
+                    let core = self.core.lock().unwrap();
+                    !core.steering.is_empty() || !core.follow_up.is_empty()
+                };
+                if !has_queued {
+                    // The engine call blocks, so it runs on a blocking thread; a join
+                    // failure leaves the continuation un-minted (logged, never silent).
+                    let engine = std::sync::Arc::clone(&self.engine);
+                    // The mint task's OWN handle, captured at the spawn: a join failure
+                    // releases exactly this handle — never the mutable mirror, which a
+                    // core rebuild may have re-swapped.
+                    let mint_pending_handle = engine.goal_pending_handle();
+                    let continuation = tokio::task::spawn_blocking(move || {
+                        engine.mint_post_compaction_goal_continuation()
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "pa-daemon: post-compaction goal continuation mint failed: {error}"
+                        );
+                        // A join failure releases the mint's own captured
+                        // handle, so a later boundary may mint.
+                        AgentSessionEngine::release_goal_continuation_handle(
+                            mint_pending_handle.as_ref(),
+                        );
+                        None
+                    });
+                    if let Some(continuation) = continuation {
+                        // The state change is durable before the announcement: the mint runs
+                        // outside a turn, so the store write rides here, not the emit closure.
+                        if let Some(goal) = continuation.goal_update {
+                            {
+                                let mut core = self.core.lock().unwrap();
+                                if let Some(store) = core.store.as_mut() {
+                                    let _ = store.persist_entry(
+                                        "custom",
+                                        json!({
+                                            "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                                            "data": goal,
+                                        }),
+                                    );
+                                }
+                            }
+                            self.emit_worker_event(json!({
+                                "type": "goal_update",
+                                "goal": goal,
+                            }));
+                        }
+                        {
+                            let mut core = self.core.lock().unwrap();
+                            core.follow_up.push_back(QueuedItem {
+                                priority: QueuePriority::Background,
+                                preview: None,
+                                message: continuation.request.message,
+                                custom_message: continuation.request.custom_message,
+                                agent_message: None,
+                                input_identity: None,
+                                queue_key: None,
+                                admission_id: None,
+                                images: continuation.request.images,
+                                done: None,
+                                queue_visible: false,
+                                policy: TurnPolicy::Injected,
+                                forced_batch: false,
+                            });
+                        }
+                        // The admission checkpoint: the continuation is admitted while the
+                        // session is idle, so without this record a kill before the turn's
+                        // settle would park it on a plain boot.
+                        self.checkpoint_queue(QueueCheckpoint::Admitted {
+                            operation: "follow_up_queued",
+                        });
+                        // The item's OWN handle releases at the
+                        // admission, never the mutable mirror.
+                        AgentSessionEngine::release_goal_continuation_handle(
+                            continuation.pending_handle.as_ref(),
+                        );
+                    }
+                }
+                // The resume site: clears the suspension and wakes the
+                // runner.
+                self.resume_queued_input();
+                goal_continue_scheduled = true;
+            }
+        }
+        match outcome {
+            crate::engine::CompactionOutcome::Compacted { run } => {
+                let run = *run;
+                // The compact-trigger review consumes here while the session is idle;
+                // the goal-continue branch defers to that turn's boundary instead of
+                // interleaving before it.
+                let engine = std::sync::Arc::clone(&self.engine);
+                let refined = if goal_continue_scheduled {
+                    Ok(None)
+                } else {
+                    tokio::task::spawn_blocking(move || engine.consume_compact_auto_refine())
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(anyhow::anyhow!("auto-refinement task failed: {error}"))
+                        })
+                };
+                match refined {
+                    Ok(Some(result)) => {
+                        let outcome_row =
+                            pa_core::session_engine::refine::create_refinement_outcome_message(
+                                &result,
+                            );
+                        if let Ok(value) = serde_json::to_value(
+                            pa_types::session::AgentMessage::Custom(outcome_row),
+                        ) {
+                            self.emit_custom_row(&value);
+                        }
+                        if result.applied_edits.iter().any(|edit| edit.applied) {
+                            let notice =
+                                pa_core::session_engine::refine::create_refinement_notice_message(
+                                    &result,
+                                    pa_core::session_engine::refine::RefinementSource::Auto,
+                                );
+                            if let Ok(value) = serde_json::to_value(
+                                pa_types::session::AgentMessage::Custom(notice),
+                            ) {
+                                self.emit_custom_row(&value);
+                            }
+                        }
+                        crate::user_bash::emit_session_event_frame(
+                            &self.core,
+                            &self.events,
+                            crate::worker::refine_complete_event(&result),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("pa-daemon: auto-refinement after compaction failed: {error:#}");
+                        self.emit_worker_event(json!({
+                            "type": "refine_failed",
+                            "error": format!("{error:#}"),
+                        }));
+                    }
+                }
+                response_success(None, "compact", Some(run.result))
+            }
+            crate::engine::CompactionOutcome::Skipped { message } => {
+                response_failure(None, "compact", &message, None)
+            }
+            crate::engine::CompactionOutcome::Aborted => {
+                response_failure(None, "compact", "Compaction cancelled", None)
+            }
+            crate::engine::CompactionOutcome::Failed { error } => {
+                response_failure(None, "compact", &error, None)
+            }
+        }
+    }
+
+    /// The idle park shared by `wait_for_idle` and the headless barrier:
+    /// register the permit before the flag check, or a turn that settles
+    /// between the check and the await loses its wake
+    /// (`notify_waiters` only reaches registered futures).
+    #[cfg(test)]
+    pub(crate) async fn wait_until_idle(&self) {
+        self.wait_until_idle_with_background(false).await;
+    }
+
+    /// Strong completion owns kernel background handles; ordinary turn-idle does not.
+    pub(super) async fn wait_until_idle_with_background(&self, include_background: bool) {
+        loop {
+            let idle = self.idle_notify.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            let fallback = tokio::sync::Notify::new();
+            let background_notify = self
+                .agent_engine
+                .as_ref()
+                .map_or(&fallback, |engine| &engine.goal_retry_notify);
+            let background_settled = background_notify.notified();
+            tokio::pin!(background_settled);
+            background_settled.as_mut().enable();
+            {
+                let core = self.core.lock().unwrap();
+                let stopped =
+                    core.abort_requested && core.queued_input_suspended || core.shutdown_requested;
+                if !core.busy
+                    && (core.steering.is_empty() && core.follow_up.is_empty()
+                        || self.input_pauses.paused()
+                        || include_background && stopped)
+                    && (!include_background || !self.engine.has_background_bash() || stopped)
+                {
+                    return;
+                }
+            }
+            tokio::select! {
+                () = &mut idle => {},
+                () = &mut background_settled => {},
+            }
+        }
+    }
+
+    /// The idle wait, plus `waitForRlmQuiescence` (TS
+    /// `waitForHeadlessCompletion`'s strong arm over `agent-session.ts`
+    /// `waitForRlmQuiescence`): the barrier also owns descendant work - it
+    /// holds past the session's idle until every tracked child run's
+    /// settle funnel fires (after the terminal notice is delivered), and
+    /// the settle loop re-runs the idle wait, so a settled child's
+    /// terminal notice (a queued turn) drains inside the barrier exactly
+    /// like TS's "work may start at the child-settlement boundary"
+    /// re-check.
+    async fn wait_until_quiescent(&self, payload: &Value, include_background: bool) {
+        let children = if payload.get("waitForRlmQuiescence").and_then(Value::as_bool) == Some(true)
+        {
+            self.agent_engine
+                .as_ref()
+                .and_then(|engine| engine.children.clone())
+        } else {
+            None
+        };
+        loop {
+            self.wait_until_idle_with_background(include_background)
+                .await;
+            let Some(children) = children.as_ref() else {
+                return;
+            };
+            // Register the permit before the unsettled-work read: a run
+            // that settles between the read and the await still wakes
+            // this waiter.
+            let settled = children.settle_notified();
+            if !children.any_running().await {
+                // A settle funnel queues its terminal-notice follow-up BEFORE it
+                // marks the run settled, so one more idle wait drains the owed
+                // notices before the barrier answers.
+                self.wait_until_idle_with_background(include_background)
+                    .await;
+                // A notice can start new child work during that drain (a settle
+                // hook spawning a descendant): re-read before answering, so the
+                // barrier holds for the new work too.
+                if !children.any_running().await {
+                    return;
+                }
+                continue;
+            }
+            settled.await;
+        }
+    }
+
+    /// `wait_for_idle`: park until the session is idle;
+    /// `waitForRlmQuiescence` also holds until its RLM children settled
+    /// (the parent-side settle watcher and `collect` wait out a child's
+    /// whole subtree this way).
+    pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
+        self.wait_until_quiescent(
+            payload,
+            payload.get("waitForRlmQuiescence").and_then(Value::as_bool) == Some(true),
+        )
+        .await;
+        response_success(None, "wait_for_idle", None)
+    }
+
+    /// `wait_for_headless_completion` (TS daemon command): settle the
+    /// headless run first (same idle wait as `wait_for_idle`), then answer
+    /// the autonomous-run accounting snapshot (`DaemonAutonomousStatus`).
+    pub(crate) async fn handle_wait_for_headless_completion(
+        &self,
+        payload: &Value,
+    ) -> DaemonResponse {
+        if let Err(response) = self.require_created("wait_for_headless_completion") {
+            return response;
+        }
+        // A natural turn can end while a kernel background Bash handle owns
+        // its goal continuation. The worker is idle then, but the settle hook
+        // has not yet admitted the next turn. Keep this headless-only barrier
+        // across that handoff and across an armed goal backoff wake.
+        let mut retried_unwoken = false;
+        loop {
+            let Some(engine) = self.agent_engine.as_ref() else {
+                self.wait_until_quiescent(payload, true).await;
+                break;
+            };
+            let idle = self.idle_notify.notified();
+            let retry = engine.goal_retry_notify.notified();
+            tokio::pin!(idle);
+            tokio::pin!(retry);
+            idle.as_mut().enable();
+            retry.as_mut().enable();
+            self.wait_until_quiescent(payload, true).await;
+            let aborted_while_idle = {
+                let core = self.core.lock().unwrap();
+                core.abort_requested && core.queued_input_suspended
+            };
+            if aborted_while_idle {
+                break;
+            }
+            let mut settled_candidate = false;
+            match engine.headless_goal_wait_state().await {
+                HeadlessGoalWait::Settled => {
+                    // A retry can admit a turn after the prior idle read.
+                    self.wait_until_quiescent(payload, true).await;
+                    if engine.headless_goal_wait_state().await == HeadlessGoalWait::Settled {
+                        settled_candidate = true;
+                    }
+                }
+                HeadlessGoalWait::RetryOwed if !retried_unwoken => {
+                    // Bash settlement can precede its callback by a few
+                    // instructions. Consult the owed continuation ourselves
+                    // once; a failed persist must not keep this wait alive.
+                    retried_unwoken = true;
+                    engine.retry_owed_goal_continuation();
+                }
+                HeadlessGoalWait::RetryOwed => {
+                    self.wait_until_quiescent(payload, true).await;
+                    if matches!(
+                        engine.headless_goal_wait_state().await,
+                        HeadlessGoalWait::RetryOwed | HeadlessGoalWait::Settled
+                    ) {
+                        settled_candidate = true;
+                    }
+                }
+                HeadlessGoalWait::Pending => retried_unwoken = false,
+                HeadlessGoalWait::Retrying => {}
+            }
+            if settled_candidate {
+                // The goal sink clears its pending guard only after queue
+                // admission. A turn may have started since the last idle
+                // read, so check the worker lane once more before returning.
+                let core = self.core.lock().unwrap();
+                if !core.busy
+                    && (core.steering.is_empty() && core.follow_up.is_empty()
+                        || self.input_pauses.paused())
+                {
+                    break;
+                }
+                continue;
+            }
+            tokio::select! {
+                () = &mut idle => {},
+                () = &mut retry => {},
+            }
+        }
+        // The idle wait finished, so no turn holds the accounting state;
+        // the snapshot read cannot interleave with a running turn.
+        let status = self
+            .engine
+            .autonomous_status()
+            .await
+            .unwrap_or_else(pa_core::autonomous::disabled_autonomous_status);
+        response_success(
+            None,
+            "wait_for_headless_completion",
+            Some({
+                let mut value = serde_json::to_value(&status).unwrap_or(Value::Null);
+                if let Ok(gate) = self.engine.orchestration_gate(None).await {
+                    value["orchestrationGate"] = gate;
+                }
+                value
+            }),
+        )
+    }
+}
+/// Agents-view visibility is message-based: a resident subagent is visible
+/// before its first message; a message-less top-level session is a draft the
+/// view hides. A busy turn is live, so a mid-turn roster delta must never
+/// classify the running session as a draft.
+pub(super) fn active_lifecycle(runtime_kind: &str, messageless: bool, busy: bool) -> &'static str {
+    if runtime_kind == "subagent" || !messageless || busy {
+        "live"
+    } else {
+        "draft"
+    }
+}
+
+#[cfg(test)]
+mod shutdown_replay_tests {
+    use super::*;
+    #[tokio::test]
+    async fn shutdown_continuation_respects_parked_managed_settle() {
+        for (suspended, child) in [(false, false), (true, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal_path = dir.path().join("recovery.jsonl");
+            let worker = std::sync::Arc::new(Worker::new(
+                super::super::WorkerConfig {
+                    socket_path: dir.path().join("worker.sock"),
+                    supervisor_socket_path: std::path::PathBuf::new(),
+                    token: "fixture".into(),
+                    worker_instance_id: String::new(),
+                    active_session_id: "shutdown-fixture".into(),
+                    agent_dir: dir.path().join("agent"),
+                    recovery_journal_path: journal_path.clone(),
+                    telemetry_disabled: None,
+                    script: Some(json!({"responses":["ack"]})),
+                },
+                None,
+            ));
+            // Let the automatically spawned runner reach its initial idle boundary
+            // before simulating an in-flight turn; otherwise it clears busy first.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                worker.idle_notify.notified(),
+            )
+            .await
+            .unwrap();
+            *worker.recovery.lock().unwrap() =
+                Some(crate::journal::WorkerRecoveryJournal::open(&journal_path).unwrap());
+            {
+                let mut core = worker.core.lock().unwrap();
+                core.busy = true;
+                if child {
+                    core.runtime_kind = "subagent".into();
+                }
+            }
+            let stopping = worker.idle_notify.notified();
+            tokio::pin!(stopping);
+            stopping.as_mut().enable();
+            let shutdown = {
+                let worker = worker.clone();
+                tokio::spawn(async move {
+                    worker
+                        .handle_shutdown(&json!({"daemonShutdown":true}))
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(3), stopping)
+                .await
+                .unwrap();
+            {
+                let mut core = worker.core.lock().unwrap();
+                core.busy = false;
+                core.queued_input_suspended = suspended;
+            }
+            worker.idle_notify.notify_waiters();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(3), shutdown)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success
+            );
+            assert_eq!(
+                worker.core.lock().unwrap().steering.len(),
+                usize::from(!suspended && !child)
+            );
+            assert_eq!(
+                crate::journal::WorkerRecoveryJournal::read_interrupted(&journal_path),
+                !suspended && !child
+            );
+        }
+    }
+}

@@ -1,0 +1,737 @@
+{
+  "schema": "named-cli-inherited-dual-oracle-v1",
+  "baseline": {
+    "nativeSourceCommit": "3c8ec4cdc643339bac4f2b516e9f98dad7ed9900",
+    "nativeElfSha256": "1fb10f68a96f172150138ab37d58a0b1017e67312f298435c7a3de58f439d62a",
+    "candidateElfSha256": "7da7aa7fc537eb923bf883a0f676db6a5045c440b900639a0af35c71c3b9900d",
+    "tsVersion": "0.9.8",
+    "tsShimSha256": "6879f47096abf698a255ba66a99cb523d37aa4dc82999064508b9db29107ee62",
+    "tsEntrypointSha256": "56fdcb9f348aa3919a2537b0046410b5c4013ff37fe7805a73138d49f6a76fa2",
+    "rawSourceFixtureSha256": "329556a607b82f818777f86615a663bb3b52f3e1262c6ebc099de103b3f0cb58",
+    "rawReceiptPath": "cli-three-way-exact3c8-20261022-v1/receipt.json",
+    "rawReceiptSha256": "12e1f2baec0b35f6fabe1c9f95062bf62f8810a00f8f08167b698a785fb95bdf",
+    "rawInvocationsSha256": "23ba2f0c019a3f98ccc68348bd7f7896a44bedea206ba83e552352d2e342741d",
+    "caseCount": 199,
+    "nativeCandidateDifferences": 0
+  },
+  "comparison": "Existing sandbox/docs/prompt-row/version normalization is unchanged. Separate exit/stdout/stderr and all existing export data/CSS/scaffolding/missing-file effects remain checked. Every non-named case requires complete TS equality; any new mismatch fails.",
+  "cases": [
+    {
+      "name": "native_version_stdout_long",
+      "caseIndex": 0,
+      "argv": [
+        "--version"
+      ],
+      "reason": "The installed Native version command writes stdout; TS0.9.8 writes stderr. Preserve the separate streams exactly.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "X.X.X",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "X.X.X"
+      }
+    },
+    {
+      "name": "native_version_stdout_short",
+      "caseIndex": 1,
+      "argv": [
+        "-v"
+      ],
+      "reason": "The installed Native version command writes stdout; TS0.9.8 writes stderr. Preserve the separate streams exactly.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "X.X.X",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "X.X.X"
+      }
+    },
+    {
+      "name": "native_full_help_stdout_long",
+      "caseIndex": 2,
+      "argv": [
+        "--help"
+      ],
+      "reason": "Installed Native help describes the fixed Rust harness, telemetry/factory and managed Rust updater; TS0.9.8 describes JavaScript extension controls. Preserve both complete help texts and stream placement.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "prime-agent - AI coding assistant with a Python REPL tool\n\nUsage:\n  prime-agent [options] [@files...] [message...]\n  prime-agent <command> [args...]\n\nOptions:\nRun options:\n  -p, --print                        Print a response and exit\n  --mode <text|json|rpc|acp|daemon>  Select the output mode (default: text)\n  --cwd <dir>                        Use a specific working directory\n  --offline                          Disable startup network operations\n  --verbose                          Force verbose startup\n  --daemon-socket <path>             Use a specific daemon socket\n\nModel options:\n  --provider <name>    Select a model provider\n  --model <id>         Select a model\n  --api-key <key>      Use an API key for this run\n  --models <patterns>  Set comma-separated models for cycling\n  --thinking <level>   Set reasoning: off, minimal, low, medium, high, xhigh, max\n\nSession options:\n  -c, --continue           Continue the previous session\n  -r, --resume [path|id]   Open the agents view, or resume a saved session\n  --fork <path|id>         Fork a saved session into a new session\n  --session-dir <dir>      Use a custom session directory\n  --no-session             Do not save the session\n  --goal <objective>       Seed a persistent goal for a new root session\n  --goal-token-budget <n>  Set a positive token budget for --goal\n\nResource options:\n  --skill <path>              Load a skill (repeatable)\n  -ns, --no-skills            Disable skill discovery\n  --prompt-template <path>    Load a prompt template (repeatable)\n  -np, --no-prompt-templates  Disable prompt template discovery\n  --theme <path>              Load a theme (repeatable)\n  --no-themes                 Disable theme discovery\n  -nc, --no-context-files     Disable AGENTS.md and CLAUDE.md discovery\n\nPrompt options:\n  --system-prompt <text>         Replace the default system prompt\n  --append-system-prompt <text>  Append to the system prompt (repeatable)\n  --                             Treat all following arguments as messages\n\nAutonomous options:\n  --autonomous                        Continue until gates pass or a limit is reached\n  --autonomous-gate <command>         Run a completion gate (repeatable)\n  --autonomous-gate-retries <n>       Set positive retries per failed gate (default: 3)\n  --autonomous-gate-timeout-ms <n>    Set positive per-gate timeout in ms (default: 300000)\n  --autonomous-max-continuations <n>  Set positive follow-up limit (default: 3)\n  --autonomous-max-turns <n>          Set positive assistant-turn limit (default: 12)\n  --autonomous-max-tokens <n>         Set positive token limit (default: 80000)\n  --autonomous-timeout-ms <n>         Set positive wall-clock limit in ms (default: 1800000)\n\nHelp:\n  -v, --version  Show version and exit\n  -h, --help     Show this help\n\nCommands:\n  help       Show command help\n  agents     Search and open sessions\n  list       List agents\n  sessions   Show agent status, activity, and usage\n  attach     Attach the interactive UI to an agent\n  stop       Stop an agent\n  rename     Rename an agent\n  send       Send a message to an agent\n  schedule   Manage prompts that run later or on a recurring schedule\n  status     Show background service status\n  telemetry  Show or change usage telemetry\n  doctor     Inspect and safely clean up background services\n  incident   Reconstruct a daemon incident from its logs\n  shutdown   Stop every agent and background service\n  mcp        Manage user MCP servers\n  package    Manage capability packages\n  update     Update to the latest Rust build (uninstalls the TypeScript version)\n  model      Inspect available models\n  session    Manage saved sessions\n  config     Configure package resources\n  factory    Share and run factory machines from the machine library\n\nRun \"prime-agent help <command>\" for command details.",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "prime-agent - AI coding assistant with a Python REPL tool\n\nUsage:\n  prime-agent [options] [@files...] [message...]\n  prime-agent <command> [args...]\n\nOptions:\nRun options:\n  -p, --print                        Print a response and exit\n  --mode <text|json|rpc|acp|daemon>  Select the output mode (default: text)\n  --cwd <dir>                        Use a specific working directory\n  --offline                          Disable startup network operations\n  --verbose                          Force verbose startup\n  --daemon-socket <path>             Use a specific daemon socket\n\nModel options:\n  --provider <name>    Select a model provider\n  --model <id>         Select a model\n  --api-key <key>      Use an API key for this run\n  --models <patterns>  Set comma-separated models for cycling\n  --thinking <level>   Set reasoning: off, minimal, low, medium, high, xhigh, max\n\nSession options:\n  -c, --continue           Continue the previous session\n  -r, --resume [path|id]   Open the agents view, or resume a saved session\n  --fork <path|id>         Fork a saved session into a new session\n  --session-dir <dir>      Use a custom session directory\n  --no-session             Do not save the session\n  --goal <objective>       Seed a persistent goal for a new root session\n  --goal-token-budget <n>  Set a positive token budget for --goal\n\nTool and resource options:\n  -t, --tools <list>          Allowlist comma-separated tool names\n  -nt, --no-tools             Disable all tools by default\n  -nbt, --no-builtin-tools    Disable built-in tools by default\n  -e, --extension <source>    Load an extension (repeatable)\n  -ne, --no-extensions        Disable extension discovery\n  --skill <path>              Load a skill (repeatable)\n  -ns, --no-skills            Disable skill discovery\n  --prompt-template <path>    Load a prompt template (repeatable)\n  -np, --no-prompt-templates  Disable prompt template discovery\n  --theme <path>              Load a theme (repeatable)\n  --no-themes                 Disable theme discovery\n  -nc, --no-context-files     Disable AGENTS.md and CLAUDE.md discovery\n\nPrompt options:\n  --system-prompt <text>         Replace the default system prompt\n  --append-system-prompt <text>  Append to the system prompt (repeatable)\n  --                             Treat all following arguments as messages\n\nAutonomous options:\n  --autonomous                        Continue until gates pass or a limit is reached\n  --autonomous-gate <command>         Run a completion gate (repeatable)\n  --autonomous-gate-retries <n>       Set positive retries per failed gate (default: 3)\n  --autonomous-gate-timeout-ms <n>    Set positive per-gate timeout in ms (default: 300000)\n  --autonomous-max-continuations <n>  Set positive follow-up limit (default: 3)\n  --autonomous-max-turns <n>          Set positive assistant-turn limit (default: 12)\n  --autonomous-max-tokens <n>         Set positive token limit (default: 80000)\n  --autonomous-timeout-ms <n>         Set positive wall-clock limit in ms (default: 1800000)\n\nHelp:\n  -v, --version  Show version and exit\n  -h, --help     Show this help\n\nCommands:\n  help      Show command help\n  agents    Search and open sessions\n  list      List agents\n  sessions  Show agent status, activity, and usage\n  attach    Attach the interactive UI to an agent\n  stop      Stop an agent\n  rename    Rename an agent\n  send      Send a message to an agent\n  schedule  Manage prompts that run later or on a recurring schedule\n  status    Show background service status\n  doctor    Inspect and safely clean up background services\n  incident  Reconstruct a daemon incident from its logs\n  shutdown  Stop every agent and background service\n  mcp       Manage user MCP servers\n  package   Manage capability packages\n  update    Update Prime Agent\n  model     Inspect available models\n  session   Manage saved sessions\n  config    Configure package resources\n\nRun \"prime-agent help <command>\" for command details."
+      }
+    },
+    {
+      "name": "native_full_help_stdout_short",
+      "caseIndex": 3,
+      "argv": [
+        "-h"
+      ],
+      "reason": "Installed Native help describes the fixed Rust harness, telemetry/factory and managed Rust updater; TS0.9.8 describes JavaScript extension controls. Preserve both complete help texts and stream placement.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "prime-agent - AI coding assistant with a Python REPL tool\n\nUsage:\n  prime-agent [options] [@files...] [message...]\n  prime-agent <command> [args...]\n\nOptions:\nRun options:\n  -p, --print                        Print a response and exit\n  --mode <text|json|rpc|acp|daemon>  Select the output mode (default: text)\n  --cwd <dir>                        Use a specific working directory\n  --offline                          Disable startup network operations\n  --verbose                          Force verbose startup\n  --daemon-socket <path>             Use a specific daemon socket\n\nModel options:\n  --provider <name>    Select a model provider\n  --model <id>         Select a model\n  --api-key <key>      Use an API key for this run\n  --models <patterns>  Set comma-separated models for cycling\n  --thinking <level>   Set reasoning: off, minimal, low, medium, high, xhigh, max\n\nSession options:\n  -c, --continue           Continue the previous session\n  -r, --resume [path|id]   Open the agents view, or resume a saved session\n  --fork <path|id>         Fork a saved session into a new session\n  --session-dir <dir>      Use a custom session directory\n  --no-session             Do not save the session\n  --goal <objective>       Seed a persistent goal for a new root session\n  --goal-token-budget <n>  Set a positive token budget for --goal\n\nResource options:\n  --skill <path>              Load a skill (repeatable)\n  -ns, --no-skills            Disable skill discovery\n  --prompt-template <path>    Load a prompt template (repeatable)\n  -np, --no-prompt-templates  Disable prompt template discovery\n  --theme <path>              Load a theme (repeatable)\n  --no-themes                 Disable theme discovery\n  -nc, --no-context-files     Disable AGENTS.md and CLAUDE.md discovery\n\nPrompt options:\n  --system-prompt <text>         Replace the default system prompt\n  --append-system-prompt <text>  Append to the system prompt (repeatable)\n  --                             Treat all following arguments as messages\n\nAutonomous options:\n  --autonomous                        Continue until gates pass or a limit is reached\n  --autonomous-gate <command>         Run a completion gate (repeatable)\n  --autonomous-gate-retries <n>       Set positive retries per failed gate (default: 3)\n  --autonomous-gate-timeout-ms <n>    Set positive per-gate timeout in ms (default: 300000)\n  --autonomous-max-continuations <n>  Set positive follow-up limit (default: 3)\n  --autonomous-max-turns <n>          Set positive assistant-turn limit (default: 12)\n  --autonomous-max-tokens <n>         Set positive token limit (default: 80000)\n  --autonomous-timeout-ms <n>         Set positive wall-clock limit in ms (default: 1800000)\n\nHelp:\n  -v, --version  Show version and exit\n  -h, --help     Show this help\n\nCommands:\n  help       Show command help\n  agents     Search and open sessions\n  list       List agents\n  sessions   Show agent status, activity, and usage\n  attach     Attach the interactive UI to an agent\n  stop       Stop an agent\n  rename     Rename an agent\n  send       Send a message to an agent\n  schedule   Manage prompts that run later or on a recurring schedule\n  status     Show background service status\n  telemetry  Show or change usage telemetry\n  doctor     Inspect and safely clean up background services\n  incident   Reconstruct a daemon incident from its logs\n  shutdown   Stop every agent and background service\n  mcp        Manage user MCP servers\n  package    Manage capability packages\n  update     Update to the latest Rust build (uninstalls the TypeScript version)\n  model      Inspect available models\n  session    Manage saved sessions\n  config     Configure package resources\n  factory    Share and run factory machines from the machine library\n\nRun \"prime-agent help <command>\" for command details.",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "prime-agent - AI coding assistant with a Python REPL tool\n\nUsage:\n  prime-agent [options] [@files...] [message...]\n  prime-agent <command> [args...]\n\nOptions:\nRun options:\n  -p, --print                        Print a response and exit\n  --mode <text|json|rpc|acp|daemon>  Select the output mode (default: text)\n  --cwd <dir>                        Use a specific working directory\n  --offline                          Disable startup network operations\n  --verbose                          Force verbose startup\n  --daemon-socket <path>             Use a specific daemon socket\n\nModel options:\n  --provider <name>    Select a model provider\n  --model <id>         Select a model\n  --api-key <key>      Use an API key for this run\n  --models <patterns>  Set comma-separated models for cycling\n  --thinking <level>   Set reasoning: off, minimal, low, medium, high, xhigh, max\n\nSession options:\n  -c, --continue           Continue the previous session\n  -r, --resume [path|id]   Open the agents view, or resume a saved session\n  --fork <path|id>         Fork a saved session into a new session\n  --session-dir <dir>      Use a custom session directory\n  --no-session             Do not save the session\n  --goal <objective>       Seed a persistent goal for a new root session\n  --goal-token-budget <n>  Set a positive token budget for --goal\n\nTool and resource options:\n  -t, --tools <list>          Allowlist comma-separated tool names\n  -nt, --no-tools             Disable all tools by default\n  -nbt, --no-builtin-tools    Disable built-in tools by default\n  -e, --extension <source>    Load an extension (repeatable)\n  -ne, --no-extensions        Disable extension discovery\n  --skill <path>              Load a skill (repeatable)\n  -ns, --no-skills            Disable skill discovery\n  --prompt-template <path>    Load a prompt template (repeatable)\n  -np, --no-prompt-templates  Disable prompt template discovery\n  --theme <path>              Load a theme (repeatable)\n  --no-themes                 Disable theme discovery\n  -nc, --no-context-files     Disable AGENTS.md and CLAUDE.md discovery\n\nPrompt options:\n  --system-prompt <text>         Replace the default system prompt\n  --append-system-prompt <text>  Append to the system prompt (repeatable)\n  --                             Treat all following arguments as messages\n\nAutonomous options:\n  --autonomous                        Continue until gates pass or a limit is reached\n  --autonomous-gate <command>         Run a completion gate (repeatable)\n  --autonomous-gate-retries <n>       Set positive retries per failed gate (default: 3)\n  --autonomous-gate-timeout-ms <n>    Set positive per-gate timeout in ms (default: 300000)\n  --autonomous-max-continuations <n>  Set positive follow-up limit (default: 3)\n  --autonomous-max-turns <n>          Set positive assistant-turn limit (default: 12)\n  --autonomous-max-tokens <n>         Set positive token limit (default: 80000)\n  --autonomous-timeout-ms <n>         Set positive wall-clock limit in ms (default: 1800000)\n\nHelp:\n  -v, --version  Show version and exit\n  -h, --help     Show this help\n\nCommands:\n  help      Show command help\n  agents    Search and open sessions\n  list      List agents\n  sessions  Show agent status, activity, and usage\n  attach    Attach the interactive UI to an agent\n  stop      Stop an agent\n  rename    Rename an agent\n  send      Send a message to an agent\n  schedule  Manage prompts that run later or on a recurring schedule\n  status    Show background service status\n  doctor    Inspect and safely clean up background services\n  incident  Reconstruct a daemon incident from its logs\n  shutdown  Stop every agent and background service\n  mcp       Manage user MCP servers\n  package   Manage capability packages\n  update    Update Prime Agent\n  model     Inspect available models\n  session   Manage saved sessions\n  config    Configure package resources\n\nRun \"prime-agent help <command>\" for command details."
+      }
+    },
+    {
+      "name": "native_full_help_command",
+      "caseIndex": 4,
+      "argv": [
+        "help"
+      ],
+      "reason": "Installed Native help describes the fixed Rust harness, telemetry/factory and managed Rust updater; TS0.9.8 describes JavaScript extension controls. Preserve both complete help texts and stream placement.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "prime-agent - AI coding assistant with a Python REPL tool\n\nUsage:\n  prime-agent [options] [@files...] [message...]\n  prime-agent <command> [args...]\n\nOptions:\nRun options:\n  -p, --print                        Print a response and exit\n  --mode <text|json|rpc|acp|daemon>  Select the output mode (default: text)\n  --cwd <dir>                        Use a specific working directory\n  --offline                          Disable startup network operations\n  --verbose                          Force verbose startup\n  --daemon-socket <path>             Use a specific daemon socket\n\nModel options:\n  --provider <name>    Select a model provider\n  --model <id>         Select a model\n  --api-key <key>      Use an API key for this run\n  --models <patterns>  Set comma-separated models for cycling\n  --thinking <level>   Set reasoning: off, minimal, low, medium, high, xhigh, max\n\nSession options:\n  -c, --continue           Continue the previous session\n  -r, --resume [path|id]   Open the agents view, or resume a saved session\n  --fork <path|id>         Fork a saved session into a new session\n  --session-dir <dir>      Use a custom session directory\n  --no-session             Do not save the session\n  --goal <objective>       Seed a persistent goal for a new root session\n  --goal-token-budget <n>  Set a positive token budget for --goal\n\nResource options:\n  --skill <path>              Load a skill (repeatable)\n  -ns, --no-skills            Disable skill discovery\n  --prompt-template <path>    Load a prompt template (repeatable)\n  -np, --no-prompt-templates  Disable prompt template discovery\n  --theme <path>              Load a theme (repeatable)\n  --no-themes                 Disable theme discovery\n  -nc, --no-context-files     Disable AGENTS.md and CLAUDE.md discovery\n\nPrompt options:\n  --system-prompt <text>         Replace the default system prompt\n  --append-system-prompt <text>  Append to the system prompt (repeatable)\n  --                             Treat all following arguments as messages\n\nAutonomous options:\n  --autonomous                        Continue until gates pass or a limit is reached\n  --autonomous-gate <command>         Run a completion gate (repeatable)\n  --autonomous-gate-retries <n>       Set positive retries per failed gate (default: 3)\n  --autonomous-gate-timeout-ms <n>    Set positive per-gate timeout in ms (default: 300000)\n  --autonomous-max-continuations <n>  Set positive follow-up limit (default: 3)\n  --autonomous-max-turns <n>          Set positive assistant-turn limit (default: 12)\n  --autonomous-max-tokens <n>         Set positive token limit (default: 80000)\n  --autonomous-timeout-ms <n>         Set positive wall-clock limit in ms (default: 1800000)\n\nHelp:\n  -v, --version  Show version and exit\n  -h, --help     Show this help\n\nCommands:\n  help       Show command help\n  agents     Search and open sessions\n  list       List agents\n  sessions   Show agent status, activity, and usage\n  attach     Attach the interactive UI to an agent\n  stop       Stop an agent\n  rename     Rename an agent\n  send       Send a message to an agent\n  schedule   Manage prompts that run later or on a recurring schedule\n  status     Show background service status\n  telemetry  Show or change usage telemetry\n  doctor     Inspect and safely clean up background services\n  incident   Reconstruct a daemon incident from its logs\n  shutdown   Stop every agent and background service\n  mcp        Manage user MCP servers\n  package    Manage capability packages\n  update     Update to the latest Rust build (uninstalls the TypeScript version)\n  model      Inspect available models\n  session    Manage saved sessions\n  config     Configure package resources\n  factory    Share and run factory machines from the machine library\n\nRun \"prime-agent help <command>\" for command details.",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "prime-agent - AI coding assistant with a Python REPL tool\n\nUsage:\n  prime-agent [options] [@files...] [message...]\n  prime-agent <command> [args...]\n\nOptions:\nRun options:\n  -p, --print                        Print a response and exit\n  --mode <text|json|rpc|acp|daemon>  Select the output mode (default: text)\n  --cwd <dir>                        Use a specific working directory\n  --offline                          Disable startup network operations\n  --verbose                          Force verbose startup\n  --daemon-socket <path>             Use a specific daemon socket\n\nModel options:\n  --provider <name>    Select a model provider\n  --model <id>         Select a model\n  --api-key <key>      Use an API key for this run\n  --models <patterns>  Set comma-separated models for cycling\n  --thinking <level>   Set reasoning: off, minimal, low, medium, high, xhigh, max\n\nSession options:\n  -c, --continue           Continue the previous session\n  -r, --resume [path|id]   Open the agents view, or resume a saved session\n  --fork <path|id>         Fork a saved session into a new session\n  --session-dir <dir>      Use a custom session directory\n  --no-session             Do not save the session\n  --goal <objective>       Seed a persistent goal for a new root session\n  --goal-token-budget <n>  Set a positive token budget for --goal\n\nTool and resource options:\n  -t, --tools <list>          Allowlist comma-separated tool names\n  -nt, --no-tools             Disable all tools by default\n  -nbt, --no-builtin-tools    Disable built-in tools by default\n  -e, --extension <source>    Load an extension (repeatable)\n  -ne, --no-extensions        Disable extension discovery\n  --skill <path>              Load a skill (repeatable)\n  -ns, --no-skills            Disable skill discovery\n  --prompt-template <path>    Load a prompt template (repeatable)\n  -np, --no-prompt-templates  Disable prompt template discovery\n  --theme <path>              Load a theme (repeatable)\n  --no-themes                 Disable theme discovery\n  -nc, --no-context-files     Disable AGENTS.md and CLAUDE.md discovery\n\nPrompt options:\n  --system-prompt <text>         Replace the default system prompt\n  --append-system-prompt <text>  Append to the system prompt (repeatable)\n  --                             Treat all following arguments as messages\n\nAutonomous options:\n  --autonomous                        Continue until gates pass or a limit is reached\n  --autonomous-gate <command>         Run a completion gate (repeatable)\n  --autonomous-gate-retries <n>       Set positive retries per failed gate (default: 3)\n  --autonomous-gate-timeout-ms <n>    Set positive per-gate timeout in ms (default: 300000)\n  --autonomous-max-continuations <n>  Set positive follow-up limit (default: 3)\n  --autonomous-max-turns <n>          Set positive assistant-turn limit (default: 12)\n  --autonomous-max-tokens <n>         Set positive token limit (default: 80000)\n  --autonomous-timeout-ms <n>         Set positive wall-clock limit in ms (default: 1800000)\n\nHelp:\n  -v, --version  Show version and exit\n  -h, --help     Show this help\n\nCommands:\n  help      Show command help\n  agents    Search and open sessions\n  list      List agents\n  sessions  Show agent status, activity, and usage\n  attach    Attach the interactive UI to an agent\n  stop      Stop an agent\n  rename    Rename an agent\n  send      Send a message to an agent\n  schedule  Manage prompts that run later or on a recurring schedule\n  status    Show background service status\n  doctor    Inspect and safely clean up background services\n  incident  Reconstruct a daemon incident from its logs\n  shutdown  Stop every agent and background service\n  mcp       Manage user MCP servers\n  package   Manage capability packages\n  update    Update Prime Agent\n  model     Inspect available models\n  session   Manage saved sessions\n  config    Configure package resources\n\nRun \"prime-agent help <command>\" for command details.",
+        "stderr": ""
+      }
+    },
+    {
+      "name": "native_fixed_harness_package_help",
+      "caseIndex": 25,
+      "argv": [
+        "help",
+        "package"
+      ],
+      "reason": "The installed fixed-harness Native package help does not promise JavaScript extensions; TS0.9.8 package help does.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "Usage:\n  prime-agent package <install|remove|list|update>\n\nManage capability packages.\n\nPackages can provide skills, prompts, and themes.\n\nCommands:\n  install  Install a capability package\n  remove   Remove a capability package\n  list     List installed capability packages\n  update   Update capability packages",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "Usage:\n  prime-agent package <install|remove|list|update>\n\nManage capability packages.\n\nPackages can provide extensions, skills, prompts, and themes.\n\nCommands:\n  install  Install a capability package\n  remove   Remove a capability package\n  list     List installed capability packages\n  update   Update capability packages",
+        "stderr": ""
+      }
+    },
+    {
+      "name": "native_managed_rust_update_help",
+      "caseIndex": 30,
+      "argv": [
+        "help",
+        "update"
+      ],
+      "reason": "The installed Native managed updater supports its Rust release/archive/source contract; TS0.9.8 retains its legacy update help. Neither command is executed by this help case.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "Usage:\n  prime-agent update [--check] [--nightly|--stable]\n\nUpdate to the latest Rust build (uninstalls the TypeScript version).\n\nMove from the TypeScript version to the Rust port in one step: `prime-agent update` fetches the update channel's installer (stable: https://app.primeintellect.ai/prime-agent/install.sh; nightly: install-beta.sh from the release download base — never a GitHub raw or workflow URL) and runs it, which uninstalls the TypeScript version and installs the latest Rust build; your sessions and configuration (~/.prime/agent) are never touched. Restart prime-agent after the update to run the new build. This command exists only in the Rust binary — the TypeScript version does not have it; the move happens when you run the installer's curl|sh URL (the README's Install section) or `prime-agent update` (after the Rust install exists).\n\nOptions:\n  --check  Print the update channel's latest release vs the running version, without installing\n  --force     Reinstall the latest build of the channel\n  --rollback  Restore the previous version the last update kept\n  --nightly   Switch updates to the nightly channel (the latest main build)\n  --stable    Return updates to the stable channel\n  --archive <path>  Install a local release archive\n  --source <url>     The https:// origin recorded as the release's install source (managed installs; required there with --archive)",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "Usage:\n  prime-agent update [--force] [--rollback] [--nightly|--stable]\n\nUpdate Prime Agent.\n\nOptions:\n  --force     Reinstall even if the current version is the latest on the channel\n  --rollback  Restore the previous compiled release\n  --nightly   Switch updates to the nightly channel (unreleased builds, may be broken)\n  --stable    Return updates to the stable channel",
+        "stderr": ""
+      }
+    },
+    {
+      "name": "native_u32_turn_limit_zero",
+      "caseIndex": 56,
+      "argv": [
+        "--autonomous-max-turns",
+        "0"
+      ],
+      "reason": "The installed Native continuation limit is a positive u32 and names its upper bound; TS0.9.8 reports only a positive-integer requirement. Both reject the input.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: --autonomous-max-turns must be a positive integer between 1 and u32::MAX (4294967295)"
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: --autonomous-max-turns must be a positive integer"
+      }
+    },
+    {
+      "name": "native_u32_turn_limit_nonnumeric",
+      "caseIndex": 57,
+      "argv": [
+        "--autonomous-max-turns",
+        "abc"
+      ],
+      "reason": "The installed Native continuation limit is a positive u32 and names its upper bound; TS0.9.8 reports only a positive-integer requirement. Both reject the input.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: --autonomous-max-turns must be a positive integer between 1 and u32::MAX (4294967295)"
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: --autonomous-max-turns must be a positive integer"
+      }
+    },
+    {
+      "name": "native_rpc_file_refusal_mentions_acp",
+      "caseIndex": 74,
+      "argv": [
+        "--mode",
+        "rpc",
+        "@file.txt"
+      ],
+      "reason": "The installed Native headless file-argument refusal also names its supported ACP mode; TS0.9.8 names RPC/daemon only. Both refuse the same input.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: @file arguments are not supported in RPC, daemon, or ACP mode"
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: @file arguments are not supported in RPC or daemon mode"
+      }
+    },
+    {
+      "name": "native_daemon_file_refusal_mentions_acp",
+      "caseIndex": 75,
+      "argv": [
+        "--mode",
+        "daemon",
+        "@file.txt"
+      ],
+      "reason": "The installed Native headless file-argument refusal also names its supported ACP mode; TS0.9.8 names RPC/daemon only. Both refuse the same input.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: @file arguments are not supported in RPC, daemon, or ACP mode"
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: @file arguments are not supported in RPC or daemon mode"
+      }
+    },
+    {
+      "name": "native_noauth_model_list_stdout",
+      "caseIndex": 123,
+      "argv": [
+        "model",
+        "list"
+      ],
+      "reason": "Without injected provider credentials, both emit the same no-model guidance, on Native stdout and TS0.9.8 stderr.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md"
+      }
+    },
+    {
+      "name": "native_noauth_gpt_filter_stdout",
+      "caseIndex": 124,
+      "argv": [
+        "model",
+        "list",
+        "gpt"
+      ],
+      "reason": "Without injected provider credentials, both emit the same no-model guidance, on Native stdout and TS0.9.8 stderr.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md"
+      }
+    },
+    {
+      "name": "native_noauth_claude_filter_stdout",
+      "caseIndex": 125,
+      "argv": [
+        "model",
+        "list",
+        "claude"
+      ],
+      "reason": "Without injected provider credentials, both emit the same no-model guidance, on Native stdout and TS0.9.8 stderr.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md"
+      }
+    },
+    {
+      "name": "native_noauth_zai_filter_stdout",
+      "caseIndex": 126,
+      "argv": [
+        "model",
+        "list",
+        "z-ai"
+      ],
+      "reason": "Without injected provider credentials, both emit the same no-model guidance, on Native stdout and TS0.9.8 stderr.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md"
+      }
+    },
+    {
+      "name": "native_noauth_no_match_filter_stdout",
+      "caseIndex": 128,
+      "argv": [
+        "model",
+        "list",
+        "zzz-nomatch-xyz"
+      ],
+      "reason": "Without injected provider credentials, both emit the same no-model guidance, on Native stdout and TS0.9.8 stderr.",
+      "rust": {
+        "exitCode": 0,
+        "stdout": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md",
+        "stderr": ""
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md"
+      }
+    },
+    {
+      "name": "native_model_list_rejects_json_option",
+      "caseIndex": 129,
+      "argv": [
+        "model",
+        "list",
+        "--json"
+      ],
+      "reason": "Installed Native rejects the unsupported model-list --json option; the legacy TS no-auth path emits its no-model guidance and exits successfully. Preserve both exact outcomes.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Unknown option: --json"
+      },
+      "ts": {
+        "exitCode": 0,
+        "stdout": "",
+        "stderr": "No models available. Use /login to log into a provider via OAuth or API key. See:\n  <PACKAGE_DOCS>/docs/providers.md\n  <PACKAGE_DOCS>/docs/models.md"
+      }
+    },
+    {
+      "name": "native_update_rejects_self_target",
+      "caseIndex": 136,
+      "argv": [
+        "update",
+        "--self"
+      ],
+      "reason": "The installed Native managed updater rejects this unsupported legacy target before effects; TS0.9.8 emits its older target-migration guidance. Do not weaken Native update authorization or rewrite product routing.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Unknown option for update: --self\nRun \"prime-agent help update\" for usage."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: An update target is no longer needed.\nUse \"prime-agent update [--force]\"."
+      }
+    },
+    {
+      "name": "native_update_rejects_package_target",
+      "caseIndex": 137,
+      "argv": [
+        "update",
+        "package"
+      ],
+      "reason": "The installed Native managed updater rejects this unsupported legacy target before effects; TS0.9.8 emits its older target-migration guidance. Do not weaken Native update authorization or rewrite product routing.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Unknown option for update: package\nRun \"prime-agent help update\" for usage."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates moved to the package command.\nUse \"prime-agent package update [source]\"."
+      }
+    },
+    {
+      "name": "native_update_rejects_extensions_target",
+      "caseIndex": 138,
+      "argv": [
+        "update",
+        "--extensions"
+      ],
+      "reason": "The installed Native managed updater rejects this unsupported legacy target before effects; TS0.9.8 emits its older target-migration guidance. Do not weaken Native update authorization or rewrite product routing.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Unknown option for update: --extensions\nRun \"prime-agent help update\" for usage."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates moved to the package command.\nUse \"prime-agent package update [source]\"."
+      }
+    },
+    {
+      "name": "native_update_rejects_mixed_self_package",
+      "caseIndex": 139,
+      "argv": [
+        "update",
+        "--self",
+        "package"
+      ],
+      "reason": "The installed Native managed updater rejects this unsupported legacy target before effects; TS0.9.8 emits its older target-migration guidance. Do not weaken Native update authorization or rewrite product routing.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Unknown option for update: --self\nRun \"prime-agent help update\" for usage."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Prime Agent and package updates are now separate.\nRun \"prime-agent update [--force]\" and \"prime-agent package update [source]\" separately."
+      }
+    },
+    {
+      "name": "native_update_rejects_mixed_self_pkg",
+      "caseIndex": 140,
+      "argv": [
+        "update",
+        "self",
+        "pkg"
+      ],
+      "reason": "The installed Native managed updater rejects this unsupported legacy target before effects; TS0.9.8 emits its older target-migration guidance. Do not weaken Native update authorization or rewrite product routing.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Unknown option for update: self\nRun \"prime-agent help update\" for usage."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Prime Agent and package updates are now separate.\nRun \"prime-agent update [--force]\" and \"prime-agent package update [source]\" separately."
+      }
+    },
+    {
+      "name": "native_update_force_does_not_accept_self_target",
+      "caseIndex": 142,
+      "argv": [
+        "update",
+        "--force",
+        "--self"
+      ],
+      "reason": "The installed Native managed updater rejects this unsupported legacy target before effects; TS0.9.8 emits its older target-migration guidance. Do not weaken Native update authorization or rewrite product routing.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Unknown option for update: --self\nRun \"prime-agent help update\" for usage."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: An update target is no longer needed.\nUse \"prime-agent update [--force]\"."
+      }
+    },
+    {
+      "name": "native_package_update_no_self_mutation_guidance",
+      "caseIndex": 147,
+      "argv": [
+        "package",
+        "update",
+        "--self"
+      ],
+      "reason": "Installed Native rejects unsupported package-update mutation flags and points to its managed updater without --force; TS0.9.8 gives its legacy --force guidance. Preserve the existing refusal and no product changes.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update\" to update Prime Agent."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update --force\" to update Prime Agent."
+      }
+    },
+    {
+      "name": "native_package_update_force_refusal",
+      "caseIndex": 152,
+      "argv": [
+        "package",
+        "update",
+        "--force"
+      ],
+      "reason": "Installed Native rejects unsupported package-update mutation flags and points to its managed updater without --force; TS0.9.8 gives its legacy --force guidance. Preserve the existing refusal and no product changes.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update\" to update Prime Agent."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update --force\" to update Prime Agent."
+      }
+    },
+    {
+      "name": "native_package_update_extension_self_refusal",
+      "caseIndex": 162,
+      "argv": [
+        "package",
+        "update",
+        "--extension",
+        "x",
+        "--self"
+      ],
+      "reason": "Installed Native rejects unsupported package-update mutation flags and points to its managed updater without --force; TS0.9.8 gives its legacy --force guidance. Preserve the existing refusal and no product changes.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update\" to update Prime Agent."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update --force\" to update Prime Agent."
+      }
+    },
+    {
+      "name": "native_package_update_extra_extension_target_refusal",
+      "caseIndex": 163,
+      "argv": [
+        "package",
+        "update",
+        "--extension",
+        "x",
+        "y"
+      ],
+      "reason": "Installed Native rejects unsupported package-update mutation flags and points to its managed updater without --force; TS0.9.8 gives its legacy --force guidance. Preserve the existing refusal and no product changes.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update\" to update Prime Agent."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update --force\" to update Prime Agent."
+      }
+    },
+    {
+      "name": "native_package_update_extensions_rollback_refusal",
+      "caseIndex": 164,
+      "argv": [
+        "package",
+        "update",
+        "--extensions",
+        "--rollback"
+      ],
+      "reason": "Installed Native rejects unsupported package-update mutation flags and points to its managed updater without --force; TS0.9.8 gives its legacy --force guidance. Preserve the existing refusal and no product changes.",
+      "rust": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update\" to update Prime Agent."
+      },
+      "ts": {
+        "exitCode": 1,
+        "stdout": "",
+        "stderr": "Error: Package updates accept only an optional source. Use \"prime-agent update --force\" to update Prime Agent."
+      }
+    }
+  ],
+  "sessionExport": {
+    "name": "native_export_success_stdout",
+    "reason": "Installed Native export success uses stdout; TS0.9.8 uses stderr. Both must export the exact pinned session data and CSS, retaining original scaffolding and missing-file assertions.",
+    "rust": {
+      "exitCode": 0,
+      "stdout": "Exported to: out.html",
+      "stderr": ""
+    },
+    "ts": {
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": "Exported to: out.html"
+    },
+    "sessionData": {
+      "header": {
+        "type": "session",
+        "version": 3,
+        "id": "d7f6e5c4",
+        "timestamp": "2026-09-01T10:00:00.000Z",
+        "cwd": "/tmp/project"
+      },
+      "entries": [
+        {
+          "type": "message",
+          "id": "e1",
+          "parentId": null,
+          "timestamp": "2026-09-01T10:00:01.000Z",
+          "message": {
+            "role": "user",
+            "content": "export a fixture"
+          }
+        },
+        {
+          "type": "message",
+          "id": "e2",
+          "parentId": "e1",
+          "timestamp": "2026-09-01T10:00:02.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "the answer"
+              }
+            ],
+            "usage": {
+              "inputTokens": 10,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "message",
+          "id": "e3",
+          "parentId": "e2",
+          "timestamp": "2026-09-01T10:00:03.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "toolCall",
+                "id": "tc1",
+                "name": "bash",
+                "arguments": {
+                  "command": "ls"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "message",
+          "id": "e4",
+          "parentId": "e3",
+          "timestamp": "2026-09-01T10:00:04.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "tc1",
+            "toolName": "bash",
+            "content": [
+              {
+                "type": "text",
+                "text": "file.txt"
+              }
+            ],
+            "isError": false
+          }
+        },
+        {
+          "type": "label",
+          "targetId": "e1",
+          "label": "start",
+          "id": "e5",
+          "parentId": "e4",
+          "timestamp": "2026-09-01T10:00:05.000Z"
+        }
+      ],
+      "leafId": "e5"
+    },
+    "cssVars": [
+      "--accent: #7c6faf;",
+      "--bashMode: #7da876;",
+      "--body-bg: #050506;",
+      "--border: #7c6faf;",
+      "--borderAccent: #7c6faf;",
+      "--borderMuted: #52525b;",
+      "--container-bg: #0d0d10;",
+      "--customMessageBg: #151518;",
+      "--customMessageLabel: #f59e0b;",
+      "--customMessageText: #e5e5e7;",
+      "--dim: #71717a;",
+      "--error: #d06f82;",
+      "--exportCardBg: #0d0d10;",
+      "--exportInfoBg: #151518;",
+      "--exportPageBg: #050506;",
+      "--info-bg: #151518;",
+      "--mdBody: #d8d8dc;",
+      "--mdCode: #c8c8cd;",
+      "--mdCodeBlock: #8ba888;",
+      "--mdCodeBlockBorder: #52525b;",
+      "--mdHeading: #8d7fc0;",
+      "--mdHr: #52525b;",
+      "--mdLink: #38bdf8;",
+      "--mdLinkUrl: #71717a;",
+      "--mdListBullet: #a1a1aa;",
+      "--mdQuote: #a1a1aa;",
+      "--mdQuoteBorder: #52525b;",
+      "--muted: #a1a1aa;",
+      "--refinementHeader: #9575cd;",
+      "--refinementSummary: #b7a1d6;",
+      "--selectedBg: #222226;",
+      "--sidebar-max-width: 840px;",
+      "--sidebar-min-width: 240px;",
+      "--sidebar-resizer-width: 6px;",
+      "--sidebar-width: 400px;",
+      "--success: #7da876;",
+      "--syntaxComment: #a1a1aa;",
+      "--syntaxFunction: #38bdf8;",
+      "--syntaxKeyword: #38bdf8;",
+      "--syntaxNumber: #f59e0b;",
+      "--syntaxOperator: #d4d4d8;",
+      "--syntaxPunctuation: #d4d4d8;",
+      "--syntaxString: #8ba888;",
+      "--syntaxType: #f59e0b;",
+      "--syntaxVariable: #d4d4d8;",
+      "--text: #e5e5e7;",
+      "--thinkingHigh: #7c6faf;",
+      "--thinkingLow: #38bdf8;",
+      "--thinkingMedium: #8d7fc0;",
+      "--thinkingMinimal: #a1a1aa;",
+      "--thinkingOff: #f4f4f5;",
+      "--thinkingText: #8b8b94;",
+      "--thinkingXhigh: #7c6faf;",
+      "--toolDiffAdded: #3fb950;",
+      "--toolDiffAddedBg: #015f00;",
+      "--toolDiffContext: #a1a1aa;",
+      "--toolDiffRemoved: #f85149;",
+      "--toolDiffRemovedBg: #5e0000;",
+      "--toolDiffText: #9aa0a6;",
+      "--toolErrorBg: #1a0d12;",
+      "--toolOutput: #a1a1aa;",
+      "--toolPanelBg: #0d0d10;",
+      "--toolPendingBg: #101015;",
+      "--toolSuccessBg: #0e1510;",
+      "--toolTitle: #e5e5e7;",
+      "--userMessageBg: #1a1a1f;",
+      "--userMessageText: #e5e5e7;",
+      "--warning: #f59e0b;"
+    ]
+  }
+}

@@ -1,0 +1,1030 @@
+//! Chat chrome: the pinned top bar, brand splash header, prompt context
+//! line, and the tray line under the editor.
+
+use crate::width::str_width;
+use crate::{Line, Span};
+use ratatui::style::Style;
+use serde_json::Value;
+
+use crate::theme::{Theme, ThemeBg, ThemeColor};
+
+/// The compact 7-row brand butterfly.
+pub const PRIME_COMPACT_BUTTERFLY_LOGO: &str = concat!(
+    "                 \u{2597}\u{2584}\u{2584}\u{2588}\u{2580}\n",
+    "   \u{2588}\u{2588}\u{2588}\u{2584}       \u{2597}\u{2584}\u{2588}\u{2588}\u{2588}\u{2580}\n",
+    "  \u{2597}\u{2588}\u{259b}\u{2590}\u{2588}\u{2599}   \u{2597}\u{2584}\u{2588}\u{2580}\u{2597}\u{2588}\u{2580}\n",
+    " \u{2597}\u{2588}\u{259b} \u{259f}\u{2588}\u{2588}\u{2599}\u{2584}\u{2588}\u{2588}\u{259b} \u{259f}\u{259b}\n",
+    " \u{2597}\u{259f}\u{258c} \u{2590}\u{2588}\u{2588}\u{2588}\u{259b}\u{2598}\u{2597}\u{2584}\u{2588}\u{2596}\n",
+    "\u{259f}\u{2588}\u{2588}\u{2588}\u{2584}  \u{2584}\u{2584}\u{259f}\u{2588}\u{2588}\u{2588}\u{2580}\n",
+    "\u{259c}\u{2588}\u{259b}\u{2580}\u{2598}  \u{259c}\u{2588}\u{259b}\u{2580}\u{2598}",
+);
+
+/// Truncate a plain string to a visible width (cut on grapheme
+/// boundaries, appending the ellipsis).
+fn truncate_to_width(value: &str, max_width: usize, ellipsis: &str) -> String {
+    if str_width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in value.chars() {
+        if str_width(&out) + crate::width::char_width(ch) > max_width {
+            break;
+        }
+        out.push(ch);
+    }
+    format!("{out}{ellipsis}")
+}
+
+/// Where a session runs; drives labels that depend on persistence.
+#[derive(Debug, Clone, Default)]
+pub struct ChromeState {
+    /// Product version shown in the splash (`prime agent vX`).
+    pub version: String,
+    /// Session working directory (splash `cwd` line; `~`-compressed).
+    pub cwd: String,
+    /// Current model id (splash `model` line; `None` hides the line).
+    pub model_id: Option<String>,
+    /// The current model's provider: two providers can carry the same id,
+    /// so only the provider disambiguates the picker's match.
+    pub model_provider: Option<String>,
+    /// Extra metadata lines under the splash (`label value` each); empty
+    /// renders none.
+    pub extra_metadata: Vec<(String, String)>,
+    /// Top-bar chat name (session name or the cwd basename).
+    pub chat_name: String,
+    /// Session spend (USD) beside the chat name: the family rollup (the
+    /// session's spend plus every subagent descendant's).
+    pub cost_usd: Option<f64>,
+    /// Context usage: tokens, window, percent (tray right label).
+    pub context: Option<ContextUsage>,
+    /// `← manage` hint: shown for persisted (attachable) sessions.
+    pub show_manage: bool,
+    /// The attached session's RLM depth: a subagent session renders
+    /// `depth N` after the manage hint, a root none.
+    pub tray_depth: Option<u32>,
+    /// Thinking effort suffix rendered as `model:effort` in the tray;
+    /// `None` keeps the bare model id.
+    pub thinking_suffix: Option<String>,
+    /// The session's service tier as its wire name: `fast` for priority, the
+    /// tier name for any other non-default tier; `None` or `default` renders no badge.
+    pub service_tier: Option<String>,
+    /// Startup warning (tmux keyboard setup), rendered as a status row.
+    pub tmux_notice: Option<String>,
+    /// Tray override label: while the Ctrl+C exit hint is armed, it
+    /// replaces the tray's location label.
+    pub tray_override: Option<String>,
+    /// The compact, borderless activity dock under the editor: a live
+    /// session always mounts it; `None` means no session owns this view.
+    pub activity: Option<ActivityDock>,
+    /// The footer's tok/sec readout: the dim bottom row's text; `None`
+    /// renders no row (kept until the first completed response).
+    pub speed_text: Option<String>,
+    /// Hide the splash `cwd` line (the scoped agents view keeps its
+    /// metadata rows centered against the logo).
+    pub splash_hide_cwd: bool,
+}
+
+/// Which actionable group owns the dock's selection. Every group is
+/// arrow-traversable whether or not it has rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivityGroup {
+    #[default]
+    Subagents,
+    Heartbeats,
+    Bash,
+    /// The factory page: live factory runs. Its group renders exactly
+    /// while the daemon advertises the `factory_activity` lane (the
+    /// opt-in gate; an advertised empty one reads its zero count) and
+    /// opens the factory page over the lane — the same navigation family
+    /// as the subagents, heartbeats, and shells pages.
+    Factory,
+    /// The active goal: its group is mounted while a goal is being
+    /// pursued and opens the read-only goal panel (the objective and
+    /// its facts); a goal that ended unmounts the row with it.
+    Goal,
+}
+
+/// Which way an Up/Down press steps along the dock's rendered groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityDirection {
+    /// The previous group, wrapping past the first.
+    Prev,
+    /// The next group, wrapping past the last.
+    Next,
+}
+
+/// The bottom activity dock: it renders in every session, all-zero
+/// included (TS `SubagentSummaryLine` renders nothing at zero — a
+/// sanctioned divergence). Unfocused it is one line of group counts;
+/// focused it expands into one row per group with each group's details
+/// (the operator's 2026-10-16 spec).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityDock {
+    /// The directly-running children right now (one addend of the dock's
+    /// single running total).
+    pub subagents_running_direct: usize,
+    /// The further running descendants below them: the total's other
+    /// addend. Idle and dead rows never count.
+    pub subagents_running_nested: usize,
+    /// The idle descendants (the expanded subagents row's breakdown).
+    pub subagents_idle: usize,
+    /// The inactive descendants (the expanded subagents row's breakdown).
+    pub subagents_inactive: usize,
+    /// The current session's heartbeats (nested sessions' jobs never
+    /// surface here).
+    pub heartbeats: usize,
+    /// The current session's active heartbeats, soonest next fire first,
+    /// each `<countdown> <label>` (the expanded row).
+    pub heartbeats_active: Vec<String>,
+    /// How many of the scoped heartbeats are paused.
+    pub heartbeats_paused: usize,
+    /// The bash processes actively running right now, one item each (the
+    /// current session's kernel registry only): finished runs stay rows
+    /// inside the bash view.
+    pub shells: Vec<String>,
+    /// How many of the running shells are persistent.
+    pub shells_persistent: usize,
+    /// The live factory runs, paused first, each `<name> <state>` (a live
+    /// state — running, stopping, or paused — or a terminal run whose
+    /// children are still in flight; the current session's kernel registry
+    /// only): fully terminal runs never inflate the group, exactly like
+    /// the shells group's running-only scoping.
+    pub factory_runs: Vec<String>,
+    /// The same live runs counted running vs paused (the collapsed count
+    /// and its paused cluster).
+    pub factory_counts: crate::factory_view::FactoryRunCounts,
+    /// Whether the factory group renders at all: the daemon's
+    /// `factory_activity` advertisement (the factory's opt-in gate —
+    /// `factory.enabled`, off by default). A daemon without the lane
+    /// mounts no factory group anywhere: no row, no traversal, no
+    /// click, no page.
+    pub factory_group: bool,
+    /// The active goal's dock label — `Pursuing goal (12m 05s)`-style,
+    /// the elapsed-time form (the operator's 2026-09-24 directive: the
+    /// row reads the time, the token budget lives inside the goal
+    /// panel); `None` unless the goal is actively being pursued (a
+    /// completed or idle goal carries no dock segment).
+    pub goal_label: Option<String>,
+    pub selected: ActivityGroup,
+    pub focused: bool,
+}
+
+impl ActivityDock {
+    /// The groups this dock renders — left to right collapsed, top to
+    /// bottom expanded — and the Up/Down traversal order. The subagents,
+    /// heartbeats, and shells groups always render (an empty one reads its
+    /// zero count or its dimmed row and stays traversable); the factory
+    /// group renders exactly while the daemon advertises the
+    /// `factory_activity` lane (the opt-in gate), and the goal group
+    /// exactly while a live goal keeps its row mounted.
+    #[must_use]
+    pub fn groups(&self) -> Vec<ActivityGroup> {
+        let mut groups = vec![
+            ActivityGroup::Subagents,
+            ActivityGroup::Heartbeats,
+            ActivityGroup::Bash,
+        ];
+        if self.factory_group {
+            groups.push(ActivityGroup::Factory);
+        }
+        if self.goal_label.is_some() {
+            groups.push(ActivityGroup::Goal);
+        }
+        groups
+    }
+
+    /// One step: the neighbor in `direction`, wrapping at the ends; a
+    /// `current` that no longer renders steps from the first group.
+    #[must_use]
+    pub fn step(&self, current: ActivityGroup, direction: ActivityDirection) -> ActivityGroup {
+        let groups = self.groups();
+        let len = groups.len();
+        let position = groups
+            .iter()
+            .position(|group| *group == current)
+            .unwrap_or(0);
+        let neighbor = match direction {
+            ActivityDirection::Prev => position + len - 1,
+            ActivityDirection::Next => position + 1,
+        };
+        groups[neighbor % len]
+    }
+}
+
+/// Context usage for the tray label (`N (P%)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub tokens: u64,
+    pub context_window: u64,
+}
+
+impl ContextUsage {
+    /// The wire shape (TS `SessionStats["contextUsage"]`, served by
+    /// `get_session_stats` and carried by the attach snapshot's state):
+    /// unknown tokens — a session right after a compaction — yield
+    /// `None`, which clears the tray display instead of keeping the
+    /// stale one (TS `patchConnectionState` replaces the snapshot).
+    #[must_use]
+    pub fn from_wire(usage: &Value) -> Option<Self> {
+        let tokens = usage.get("tokens").and_then(Value::as_u64)?;
+        let context_window = usage.get("contextWindow").and_then(Value::as_u64)?;
+        Some(Self {
+            tokens,
+            context_window,
+        })
+    }
+
+    #[must_use]
+    pub fn percent(&self) -> f64 {
+        if self.context_window == 0 {
+            0.0
+        } else {
+            (self.tokens as f64 / self.context_window as f64) * 100.0
+        }
+    }
+}
+
+#[must_use]
+pub fn format_token_count(count: u64) -> String {
+    if count < 1_000 {
+        return count.to_string();
+    }
+    if count < 10_000 {
+        return format!("{:.1}k", count as f64 / 1_000.0);
+    }
+    if count < 1_000_000 {
+        return format!("{}k", (count as f64 / 1_000.0).round() as u64);
+    }
+    if count < 10_000_000 {
+        return format!("{:.1}M", count as f64 / 1_000_000.0);
+    }
+    format!("{}M", (count as f64 / 1_000_000.0).round() as u64)
+}
+
+/// The top-bar chat name for an unnamed session: the cwd basename.
+#[must_use]
+pub fn display_name(cwd: &str) -> String {
+    std::path::Path::new(cwd).file_name().map_or_else(
+        || cwd.to_string(),
+        |name| name.to_string_lossy().to_string(),
+    )
+}
+
+/// The `~`-compressed cwd for the splash line.
+#[must_use]
+pub fn format_splash_cwd(cwd: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return cwd.replace('\\', "/");
+    };
+    let home = home.replace('\\', "/");
+    let normalized = cwd.replace('\\', "/");
+    if home.is_empty() {
+        return normalized;
+    }
+    if normalized == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = normalized.strip_prefix(&format!("{home}/")) {
+        return format!("~/{rest}");
+    }
+    normalized
+}
+
+/// Middle-truncate a path: keep the last two segments (`~/…/parent/leaf`).
+pub fn truncate_path_middle(value: &str, width: usize) -> String {
+    if str_width(value) <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return truncate_to_width(value, width, "");
+    }
+    let normalized = value.replace('\\', "/");
+    let prefix = if normalized.starts_with("~/") {
+        "~/"
+    } else if normalized.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let body = normalized[prefix.len()..].to_string();
+    let mut parts: Vec<&str> = body.split('/').filter(|part| !part.is_empty()).collect();
+    let last = parts.pop().unwrap_or_default().to_string();
+    let previous = parts.pop().map(str::to_string);
+    let suffix = previous
+        .map(|previous| format!("{previous}/{last}"))
+        .unwrap_or(last);
+    let candidate = format!("{prefix}\u{2026}/{suffix}");
+    if str_width(&candidate) <= width {
+        return candidate;
+    }
+    truncate_to_width(&candidate, width, "…")
+}
+
+/// The pinned top bar: chat name centered, spend beside it.
+pub fn render_top_bar(state: &ChromeState, theme: &Theme, width: usize) -> Line {
+    let name = state
+        .chat_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .replace(char::is_whitespace, " ")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut line: Line = Vec::new();
+    let name_width = str_width(&name);
+    let text = theme.fg_style(ThemeColor::Text);
+    let dim = theme.fg_style(ThemeColor::Dim);
+    let start = (width.saturating_sub(name_width)) / 2;
+    line.push(Span::styled(" ".repeat(start), Style::default()));
+    line.push(Span::styled(name, text));
+    if let Some(cost) = state.cost_usd.filter(|cost| *cost >= 0.0) {
+        line.push(Span::styled("  ".to_string(), Style::default()));
+        line.push(Span::styled(format!("${cost:.2}"), dim));
+    }
+    line
+}
+
+/// The brand splash: butterfly logo beside the version/model/cwd metadata
+/// (TS `BrandSplashHeader`, `topPadding` always on).
+#[must_use]
+pub fn render_splash(state: &ChromeState, theme: &Theme, width: usize) -> Vec<Line> {
+    let safe_width = width.max(1);
+    let padding_x = usize::from(safe_width > 1);
+    let content_width = safe_width.saturating_sub(padding_x * 2).max(1);
+    let logo_raw: Vec<&str> = PRIME_COMPACT_BUTTERFLY_LOGO.split('\n').collect();
+    let logo_canvas_width = logo_raw
+        .iter()
+        .map(|line| str_width(line))
+        .max()
+        .unwrap_or(0);
+    let gutter = 3usize;
+    let show_logo =
+        logo_canvas_width > 0 && content_width.saturating_sub(logo_canvas_width + gutter) >= 24;
+    let meta_width = if show_logo {
+        content_width.saturating_sub(logo_canvas_width + gutter)
+    } else {
+        content_width
+    };
+
+    let text = theme.fg_style(ThemeColor::Text);
+    let muted = theme.fg_style(ThemeColor::Muted);
+    let dim = theme.fg_style(ThemeColor::Dim);
+    let title = "prime agent";
+    let version = format!("v{}", state.version);
+    let mut meta_lines: Vec<Line> = Vec::new();
+    if str_width(&format!("{title} {version}")) <= meta_width {
+        meta_lines.push(vec![
+            Span::styled(title.to_string(), text),
+            Span::styled(" ".to_string(), Style::default()),
+            Span::styled(version, muted),
+        ]);
+    } else {
+        meta_lines.push(vec![Span::styled(title.to_string(), text)]);
+        meta_lines.push(vec![Span::styled(version, muted)]);
+    }
+    for (label_text, value_text) in &state.extra_metadata {
+        let label = format!("{label_text} ");
+        let value = truncate_to_width(
+            value_text,
+            meta_width.saturating_sub(str_width(&label)).max(1),
+            "",
+        );
+        meta_lines.push(vec![Span::styled(label, dim), Span::styled(value, muted)]);
+    }
+    if let Some(model_id) = &state.model_id {
+        let label = "model ";
+        let value = truncate_to_width(
+            model_id,
+            meta_width.saturating_sub(str_width(label)).max(1),
+            "",
+        );
+        meta_lines.push(vec![
+            Span::styled(label.to_string(), dim),
+            Span::styled(value, muted),
+        ]);
+    }
+    if !state.splash_hide_cwd {
+        let cwd_label = "cwd ";
+        let home = pa_types::platform::home_dir().map(|home| home.to_string_lossy().into_owned());
+        let cwd = truncate_path_middle(
+            &format_splash_cwd(&state.cwd, home.as_deref()),
+            meta_width.saturating_sub(str_width(cwd_label)).max(1),
+        );
+        meta_lines.push(vec![
+            Span::styled(cwd_label.to_string(), dim),
+            Span::styled(cwd, muted),
+        ]);
+    }
+
+    let mut lines: Vec<Line> = vec![Vec::new()];
+    let row_count = logo_raw.len().max(meta_lines.len());
+    let meta_start = if show_logo {
+        (row_count - meta_lines.len()) / 2
+    } else {
+        0
+    };
+    let logo_text = theme.fg_style(ThemeColor::Text);
+    for index in 0..row_count {
+        let mut spans: Line = Vec::new();
+        let pad = if padding_x > 0 { " " } else { "" };
+        spans.push(Span::styled(pad.to_string(), Style::default()));
+        if show_logo {
+            let logo_line = logo_raw.get(index).copied().unwrap_or("");
+            spans.push(Span::styled(logo_line.to_string(), logo_text));
+            let fill = logo_canvas_width.saturating_sub(str_width(logo_line)) + gutter;
+            spans.push(Span::styled(" ".repeat(fill), Style::default()));
+        }
+        let meta_index = index as isize - meta_start as isize;
+        if meta_index >= 0 {
+            if let Some(meta_line) = meta_lines.get(meta_index as usize) {
+                spans.extend(meta_line.iter().cloned());
+            }
+        }
+        let used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
+        spans.push(Span::styled(
+            " ".repeat(safe_width.saturating_sub(used + padding_x)),
+            Style::default(),
+        ));
+        lines.push(spans);
+    }
+    lines.push(Vec::new());
+    lines
+}
+
+/// The plain row above the prompt: the detail status right (TS
+/// `PromptContextLine`, always `["", row]`).
+#[must_use]
+pub fn render_prompt_context(detail_label: &str, theme: &Theme, width: usize) -> Vec<Line> {
+    if width < 1 {
+        return Vec::new();
+    }
+    let padding_x = usize::from(width > 2);
+    let content_width = width.saturating_sub(padding_x * 2);
+    let dim = theme.fg_style(ThemeColor::Dim);
+    let label_width = str_width(detail_label);
+    let label = if label_width > content_width {
+        truncate_to_width(detail_label, content_width, "")
+    } else {
+        detail_label.to_string()
+    };
+    let space = content_width.saturating_sub(str_width(&label));
+    let row = vec![
+        Span::raw(" ".repeat(padding_x)),
+        Span::raw(" ".repeat(space)),
+        Span::styled(label, dim),
+        Span::raw(" ".repeat(padding_x)),
+    ];
+    vec![Vec::new(), row]
+}
+
+/// The conversation-detail status label: "Expanded" (all output), "Details"
+/// (thinking + diffs), or "Collapsed"; only Expanded flips the key hint to "collapse".
+#[must_use]
+pub fn conversation_detail_status(all_output: bool, details: bool, key_display: &str) -> String {
+    let label = if all_output {
+        "Expanded"
+    } else if details {
+        "Details"
+    } else {
+        "Collapsed"
+    };
+    let action = if all_output { "collapse" } else { "expand" };
+    format!("{label} mode ({key_display} to {action})")
+}
+
+/// The tray row under the editor: location label left, context label
+/// right, over the full width.
+#[must_use]
+pub fn render_tray(state: &ChromeState, theme: &Theme, width: usize) -> Line {
+    render_tray_with_hint(state, theme, width).0
+}
+
+/// The tray row plus the `← manage` hint's column span: a plain click on
+/// the hint's cells performs the hinted action. `None` when the left
+/// label is the override or the hint is hidden.
+#[must_use]
+pub fn render_tray_with_hint(
+    state: &ChromeState,
+    theme: &Theme,
+    width: usize,
+) -> (Line, Option<std::ops::Range<usize>>) {
+    let dim = theme.fg_style(ThemeColor::Dim);
+    let muted = theme.fg_style(ThemeColor::Muted);
+    let mut hint: Option<std::ops::Range<usize>> = None;
+    let mut left: Line = Vec::new();
+    if let Some(override_label) = &state.tray_override {
+        // The override label replaces the location label on the left
+        // while it is set.
+        left.push(Span::styled(override_label.clone(), muted));
+    } else if state.show_manage {
+        left.push(Span::styled("\u{2190}".to_string(), dim));
+        left.push(Span::styled(" manage".to_string(), muted));
+        // The hint's own cells are the clickable region; the depth label
+        // that may follow is metadata, not part of the hinted action.
+        hint = Some(0..left.iter().map(|s| str_width(&s.content)).sum());
+        // A subagent session joins its `depth N` label onto the manage
+        // hint; a root session renders none.
+        if let Some(depth) = state.tray_depth.filter(|depth| *depth > 0) {
+            left.push(Span::styled("  ".to_string(), muted));
+            left.push(Span::styled(format!("depth {depth}"), muted));
+        }
+    }
+    let mut right: Line = Vec::new();
+    if let Some(model) = &state.model_id {
+        let mut label = model.clone();
+        if let Some(suffix) = &state.thinking_suffix {
+            label.push(':');
+            label.push_str(suffix);
+        }
+        if !right.is_empty() {
+            right.push(Span::styled(" \u{00b7} ".to_string(), dim));
+        }
+        right.push(Span::styled(label, dim));
+    }
+    let tier_badge = match state.service_tier.as_deref() {
+        Some("priority") => Some("fast"),
+        Some(tier) if tier != "default" => Some(tier),
+        _ => None,
+    };
+    if let Some(badge) = tier_badge {
+        if !right.is_empty() {
+            right.push(Span::styled(" \u{00b7} ".to_string(), dim));
+        }
+        right.push(Span::styled(badge.to_string(), dim));
+    }
+    if let Some(context) = &state.context {
+        if !right.is_empty() {
+            right.push(Span::styled(" \u{00b7} ".to_string(), dim));
+        }
+        right.push(Span::styled(
+            format!(
+                "{} ({:.0}%)",
+                format_token_count(context.tokens),
+                context.percent()
+            ),
+            dim,
+        ));
+    }
+    let left_width: usize = left.iter().map(|s| str_width(&s.content)).sum();
+    let right_width: usize = right.iter().map(|s| str_width(&s.content)).sum();
+    let gap = width.saturating_sub(left_width + right_width);
+    let mut line: Line = Vec::new();
+    line.extend(left);
+    line.push(Span::styled(" ".repeat(gap), Style::default()));
+    line.extend(right);
+    (line, hint)
+}
+
+/// The tray model label's thinking-effort suffix: a model without
+/// reasoning or a level outside the wire vocabulary renders the bare id;
+/// the tray shows `model:off`, the agents-view Model column hides "off".
+pub(crate) fn tray_thinking_suffix(state: &Value) -> Option<String> {
+    let reasoning = state
+        .get("model")
+        .and_then(|model| model.get("reasoning"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !reasoning {
+        return None;
+    }
+    state
+        .get("thinkingLevel")
+        .and_then(Value::as_str)
+        .and_then(pa_types::ai::thinking_level_from_str)
+        .map(|level| level.wire_name().to_string())
+}
+
+/// Truncate a styled span row to a visible width, replacing the tail with
+/// the ellipsis when it does not fit.
+fn truncate_spans_to_width(spans: &[crate::Span], width: usize) -> Vec<crate::Span> {
+    let mut out: Vec<crate::Span> = Vec::new();
+    let mut remaining = width;
+    for (index, span) in spans.iter().enumerate() {
+        if remaining == 0 {
+            // The frame filled on a span boundary: the later spans still
+            // exist, so the ellipsis must land.
+            if content_follows(spans, index) {
+                land_marker(&mut out, width);
+            }
+            break;
+        }
+        let mut text = String::new();
+        let mut consumed = 0usize;
+        for ch in span.content.chars() {
+            let char_width = crate::width::char_width(ch);
+            if consumed + char_width > remaining {
+                break;
+            }
+            text.push(ch);
+            consumed += char_width;
+        }
+        if text.is_empty() {
+            // This span's first character cannot fit: nothing of it
+            // renders, and the ellipsis must still mark the cut.
+            if content_follows(spans, index) {
+                land_marker(&mut out, width);
+            }
+            break;
+        }
+        if consumed < str_width(&span.content) {
+            // The span could not fit whole: the ellipsis borrows its column from
+            // the span's last kept character, so the row always ends INSIDE the width.
+            let ellipsis = crate::width::char_width('\u{2026}');
+            while consumed + ellipsis > remaining {
+                match text.pop() {
+                    Some(dropped) => consumed -= crate::width::char_width(dropped),
+                    None => break,
+                }
+            }
+            text.push('\u{2026}');
+            let mut piece = span.clone();
+            piece.content = text;
+            out.push(piece);
+            break;
+        }
+        let mut piece = span.clone();
+        piece.content = text;
+        out.push(piece);
+        remaining -= consumed;
+    }
+    out
+}
+
+/// Whether any span from `index` (inclusive) still carries content — a
+/// cut there must leave a marker.
+fn content_follows(spans: &[crate::Span], index: usize) -> bool {
+    spans[index..].iter().any(|span| !span.content.is_empty())
+}
+
+/// Land the truncation marker on a row that filled the frame on a span
+/// boundary: the ellipsis borrows a column from the last kept character.
+fn land_marker(out: &mut Vec<crate::Span>, width: usize) {
+    let ellipsis = crate::width::char_width('\u{2026}');
+    let row_width = |out: &Vec<crate::Span>| {
+        out.iter()
+            .map(|piece| crate::width::str_width(&piece.content))
+            .sum::<usize>()
+    };
+    while row_width(out) + ellipsis > width {
+        match out.last_mut() {
+            Some(piece) => {
+                if piece.content.pop().is_none() {
+                    out.pop();
+                }
+            }
+            None => break,
+        }
+    }
+    match out.last_mut() {
+        Some(piece) => piece.content.push('\u{2026}'),
+        None => {
+            if ellipsis <= width {
+                out.push(crate::Span::raw("\u{2026}"));
+            }
+        }
+    }
+}
+
+/// The framed activity dock: a muted separator rule above the
+/// actionable groups — one line of counts while unfocused, one row per
+/// group while focused. The dock renders in every session, all-zero
+/// included. The TS summary line wraps its content in an
+/// accent-colored box (`╭─ subagents ─╮`); the inline design language
+/// keeps the separation with the same muted `─` rule that frames the
+/// pickers' search fields, not an accent box.
+///
+/// The collapsed line color-codes live activity (the operator's 2026-09-24
+/// directive): every count-holding segment goes green while its count
+/// is above zero (subagents, heartbeats, shells, factory, the active
+/// goal) and stays neutral at zero. The subagents segment is one
+/// consolidated item — `◆ x subagents` (the operator's 2026-09-25
+/// consolidation: the separate running cluster was redundant).
+#[must_use]
+pub fn render_activity_dock(dock: &ActivityDock, theme: &Theme, width: usize) -> Vec<Line> {
+    render_activity_dock_segments(dock, theme, width).0
+}
+
+/// One rendered group's click surface: a plain click on the group's own
+/// cells opens that group's view (the dock's Enter route).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityDockSegment {
+    pub group: ActivityGroup,
+    /// The index of the group's line in the rendered frame (the rule is
+    /// line 0).
+    pub row: usize,
+    /// The row columns the group's spans occupy.
+    pub cols: std::ops::Range<usize>,
+}
+
+/// The framed activity dock plus its groups' click segments (see
+/// [`render_activity_dock`]): collapsed, the segments cover exactly the
+/// cells each group renders, clamped to the row the truncation kept;
+/// expanded, each group's whole row.
+#[must_use]
+pub fn render_activity_dock_segments(
+    dock: &ActivityDock,
+    theme: &Theme,
+    width: usize,
+) -> (Vec<Line>, Vec<ActivityDockSegment>) {
+    let rule = vec![theme.fg_span(ThemeColor::BorderMuted, "─".repeat(width))];
+    if dock.focused {
+        let mut lines = vec![rule];
+        let mut segments = Vec::new();
+        for group in dock.groups() {
+            segments.push(ActivityDockSegment {
+                group,
+                row: lines.len(),
+                cols: 0..width,
+            });
+            lines.push(render_expanded_dock_row(dock, group, theme, width));
+        }
+        return (lines, segments);
+    }
+    // The status-dot vocabulary (`● running / ◐ idle / ○ inactive`): the half
+    // circle marks waiting work; only the heartbeat and factory pauses keep a dot.
+    let cluster = |text: &str, color: ThemeColor| {
+        vec![
+            theme.fg_span(ThemeColor::Dim, " · ".to_string()),
+            theme.fg_span(color, text.to_string()),
+        ]
+    };
+    // The live-only number: actively-running subagents right now, direct
+    // children and nested descendants together — ONE number.
+    let running = dock.subagents_running_direct + dock.subagents_running_nested;
+    let shells = dock.shells.len();
+    let factory = dock.factory_counts;
+    let mut line = vec![Span::raw(" ")];
+    let mut segments: Vec<ActivityDockSegment> = Vec::new();
+    for (index, group) in dock.groups().into_iter().enumerate() {
+        if index > 0 {
+            line.push(theme.fg_span(ThemeColor::Dim, "  ·  "));
+        }
+        // The segment's column span is what the terminal paints (the
+        // truncation below clamps its end).
+        let start = line.iter().map(|s| str_width(&s.content)).sum();
+        match group {
+            ActivityGroup::Subagents => {
+                line.push(theme.fg_span(
+                    activity_color(running),
+                    format!(
+                        "◆ {running} subagent{}",
+                        if running == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            ActivityGroup::Heartbeats => {
+                line.push(theme.fg_span(
+                    activity_color(dock.heartbeats),
+                    format!(
+                        "◷ {} heartbeat{}",
+                        dock.heartbeats,
+                        if dock.heartbeats == 1 { "" } else { "s" }
+                    ),
+                ));
+                if dock.heartbeats_paused > 0 {
+                    line.extend(cluster(
+                        &format!("◐ {} paused", dock.heartbeats_paused),
+                        ThemeColor::Warning,
+                    ));
+                }
+            }
+            // The label reads "shell(s)": the tool name stays bash() everywhere else.
+            ActivityGroup::Bash => {
+                line.push(theme.fg_span(
+                    activity_color(shells),
+                    format!("▸ {} shell{}", shells, if shells == 1 { "" } else { "s" }),
+                ));
+                if dock.shells_persistent > 0 {
+                    line.extend(cluster(
+                        &format!("{} persistent", dock.shells_persistent),
+                        activity_color(shells),
+                    ));
+                }
+            }
+            // The factory indicator counts the running runs, and the paused
+            // ones in their own amber cluster (the heartbeats' grammar): done
+            // and failed runs stay as panels inside the factory page.
+            ActivityGroup::Factory => {
+                line.push(theme.fg_span(
+                    activity_color(factory.running),
+                    format!("⚙ {} factory", factory.running),
+                ));
+                if factory.paused > 0 {
+                    line.extend(cluster(
+                        &format!("◐ {} paused", factory.paused),
+                        ThemeColor::Warning,
+                    ));
+                }
+            }
+            ActivityGroup::Goal => line.push(goal_span(dock, theme)),
+        }
+        let end = line.iter().map(|s| str_width(&s.content)).sum();
+        segments.push(ActivityDockSegment {
+            group,
+            row: 1,
+            cols: start..end,
+        });
+    }
+    let row = truncate_spans_to_width(&line, width);
+    let rendered = row
+        .iter()
+        .map(|s| str_width(&s.content))
+        .sum::<usize>()
+        .min(width);
+    // A segment that no longer renders stays out of the click surface,
+    // and a partially kept one ends at the last painted column.
+    let segments = segments
+        .into_iter()
+        .filter(|segment| segment.cols.start < rendered)
+        .map(|mut segment| {
+            segment.cols.end = segment.cols.end.min(rendered);
+            segment
+        })
+        .collect();
+    (vec![rule, row], segments)
+}
+
+/// A count-holding segment's color: green while its count is above
+/// zero, neutral at zero.
+fn activity_color(count: usize) -> ThemeColor {
+    if count > 0 {
+        ThemeColor::Success
+    } else {
+        ThemeColor::Muted
+    }
+}
+
+/// The goal group's label: an actively pursued goal reads green, and the
+/// paused and budget-limited states read amber (the paused heartbeat
+/// cluster's own warning color) — the dock is the goal's one chrome
+/// surface, so every live state stays visible.
+fn goal_span(dock: &ActivityDock, theme: &Theme) -> Span {
+    let goal = dock.goal_label.as_deref().unwrap_or_default();
+    let color = if goal.starts_with("Pursuing goal") {
+        ThemeColor::Success
+    } else {
+        ThemeColor::Warning
+    };
+    theme.fg_span(color, goal.to_string())
+}
+
+/// The widest group name in the expanded dock (`heartbeats`): every
+/// row's details start in the same column.
+const EXPANDED_NAME_CELLS: usize = 10;
+
+/// The separator between two items of one expanded row.
+const EXPANDED_ITEM_SEPARATOR: &str = "  ·  ";
+
+/// One expanded dock row; the selected row carries the shared selection
+/// band across the full width.
+fn render_expanded_dock_row(
+    dock: &ActivityDock,
+    group: ActivityGroup,
+    theme: &Theme,
+    width: usize,
+) -> Line {
+    let row = match group {
+        ActivityGroup::Subagents => {
+            let running = dock.subagents_running_direct + dock.subagents_running_nested;
+            let breakdown =
+                (running + dock.subagents_idle + dock.subagents_inactive > 0).then(|| {
+                    format!(
+                        "{running} running · {} idle · {} inactive",
+                        dock.subagents_idle, dock.subagents_inactive
+                    )
+                });
+            expanded_group_row(
+                theme,
+                width,
+                ("◆", "subagents"),
+                running,
+                breakdown.as_slice(),
+            )
+        }
+        ActivityGroup::Heartbeats => expanded_group_row(
+            theme,
+            width,
+            ("◷", "heartbeats"),
+            dock.heartbeats_active.len(),
+            &dock.heartbeats_active,
+        ),
+        ActivityGroup::Bash => expanded_group_row(
+            theme,
+            width,
+            ("▸", "shells"),
+            dock.shells.len(),
+            &dock.shells,
+        ),
+        ActivityGroup::Factory => expanded_group_row(
+            theme,
+            width,
+            ("⚙", "factory"),
+            dock.factory_counts.running,
+            &dock.factory_runs,
+        ),
+        ActivityGroup::Goal => vec![Span::raw(" "), goal_span(dock, theme)],
+    };
+    let mut row = truncate_spans_to_width(&row, width);
+    if dock.selected == group {
+        let filled: usize = row.iter().map(|s| str_width(&s.content)).sum();
+        row.push(Span::raw(" ".repeat(width.saturating_sub(filled))));
+        let band = theme.selection_row_style();
+        for span in &mut row {
+            span.style = span.style.patch(band);
+        }
+    }
+    row
+}
+
+/// A group row: the glyph and name, then the details (as many items as
+/// fit, `+N` for the rest). An empty group renders its glyph and name
+/// dimmed with no details.
+fn expanded_group_row(
+    theme: &Theme,
+    width: usize,
+    (glyph, name): (&str, &str),
+    count: usize,
+    items: &[String],
+) -> Line {
+    let title = format!("{glyph} {name}");
+    if items.is_empty() {
+        return vec![Span::raw(" "), theme.fg_span(ThemeColor::Dim, title)];
+    }
+    let mut row = vec![
+        Span::raw(" "),
+        theme.fg_span(activity_color(count), title),
+        Span::raw(" ".repeat(EXPANDED_NAME_CELLS - str_width(name) + 2)),
+    ];
+    let used: usize = row.iter().map(|s| str_width(&s.content)).sum();
+    let available = width.saturating_sub(used);
+    let shown = fitting_items(items, available);
+    let overflow = (shown < items.len()).then(|| format!("  +{}", items.len() - shown));
+    let marker = overflow.as_deref().map_or(0, str_width);
+    for (index, item) in items[..shown].iter().enumerate() {
+        if index > 0 {
+            row.push(theme.fg_span(ThemeColor::Dim, EXPANDED_ITEM_SEPARATOR));
+        }
+        // Only an oversized first item gets clipped here, to leave the `+N` marker its room.
+        let item = if index == 0 {
+            crate::width::truncate_to_width(item, available.saturating_sub(marker), "\u{2026}")
+        } else {
+            item.clone()
+        };
+        row.push(theme.fg_span(ThemeColor::Muted, item));
+    }
+    if let Some(overflow) = overflow {
+        row.push(theme.fg_span(ThemeColor::Dim, overflow));
+    }
+    row
+}
+
+/// How many leading items fit `available` columns together with the
+/// `+N` overflow marker for the rest; the first item always shows (the
+/// caller clips an oversized one beside the marker).
+fn fitting_items(items: &[String], available: usize) -> usize {
+    let separator = str_width(EXPANDED_ITEM_SEPARATOR);
+    let mut listed = 0;
+    let mut fitting = 1;
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            listed += separator;
+        }
+        listed += str_width(item);
+        if listed > available {
+            break;
+        }
+        let shown = index + 1;
+        let overflow = if shown < items.len() {
+            str_width(&format!("  +{}", items.len() - shown))
+        } else {
+            0
+        };
+        if listed + overflow <= available {
+            fitting = shown;
+        }
+    }
+    fitting
+}
+
+/// The footer's tok/sec row: one dim line — the dock's last row —
+/// truncated with no ellipsis when it overflows the width.
+#[must_use]
+pub fn render_speed_footer(text: &str, theme: &Theme, width: usize) -> Line {
+    let dim = theme.fg_style(ThemeColor::Dim);
+    let text = truncate_to_width(text, width, "");
+    vec![Span::styled(text, dim)]
+}
+
+/// The editor surface background: `userMessageBg` (TS `getEditorTheme`).
+#[must_use]
+pub fn editor_background(theme: &Theme) -> ratatui::style::Style {
+    theme.bg_style(ThemeBg::UserMessageBg)
+}
+#[cfg(test)]
+mod tests;

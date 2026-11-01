@@ -1,0 +1,564 @@
+//! Bedrock authentication and endpoint resolution: the `SigV4` request signing used by
+//! `@aws-sdk/client-bedrock-runtime` for `POST /model/{modelId}/converse-stream`, plus the region /
+//! endpoint / credential resolution rules from the TS provider.
+
+use std::fmt::Write as _;
+use std::path::Path;
+
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+use crate::providers::bedrock::BedrockOptions;
+use crate::types::Model;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Resolved AWS credentials (env vars, profile config, or SigV4-skip dummy).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AwsCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// AWS credential files use `[profile name]` (config) or `[name]`.
+pub(crate) fn profile_section_matches(name: &str, profile: &str) -> bool {
+    name == profile
+        || name == format!("profile {profile}")
+        || name.split_whitespace().last() == Some(profile)
+}
+
+/// Parse an AWS credentials-style ini file: `[section-name]` headers with `key = value` pairs (only
+/// the two credential lines are needed).
+fn parse_ini_credentials(text: &str, section: &str) -> Option<AwsCredentials> {
+    let mut in_section = false;
+    let mut access_key_id = None;
+    let mut secret_access_key = None;
+    let mut session_token = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let name = trimmed[1..trimmed.len() - 1].trim();
+            in_section = profile_section_matches(name, section);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "aws_access_key_id" => access_key_id = Some(value),
+            "aws_secret_access_key" => secret_access_key = Some(value),
+            "aws_session_token" => session_token = Some(value),
+            _ => {}
+        }
+    }
+    Some(AwsCredentials {
+        access_key_id: access_key_id?,
+        secret_access_key: secret_access_key?,
+        session_token,
+    })
+}
+
+/// Where the shared credentials and config files live.
+#[derive(Debug, PartialEq)]
+struct AwsFilePaths {
+    credentials: Option<std::path::PathBuf>,
+    config: Option<std::path::PathBuf>,
+}
+
+/// `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` from `lookup` when set, else the defaults under
+/// `home`; an override needs no home directory.
+fn aws_file_paths(lookup: impl Fn(&str) -> Option<String>, home: Option<&Path>) -> AwsFilePaths {
+    let path = |var: &str, default: &str| {
+        lookup(var)
+            .map(std::path::PathBuf::from)
+            .or_else(|| home.map(|home| home.join(default)))
+    };
+    AwsFilePaths {
+        credentials: path("AWS_SHARED_CREDENTIALS_FILE", ".aws/credentials"),
+        config: path("AWS_CONFIG_FILE", ".aws/config"),
+    }
+}
+
+/// The SDK credential chain used by the TS provider: SigV4-skip dummy keys, static env credentials,
+/// the shared credentials file (`AWS_SHARED_CREDENTIALS_FILE` or `~/.aws/credentials`; default or
+/// `AWS_PROFILE` / `options.profile`), then the profile's `credential_process` in the AWS config
+/// file (`AWS_CONFIG_FILE` or `~/.aws/config`). May run the credential process; dropping the future
+/// kills it.
+pub async fn resolve_credentials(profile: Option<&str>) -> Option<AwsCredentials> {
+    if std::env::var("AWS_BEDROCK_SKIP_AUTH").as_deref() == Ok("1") {
+        return Some(AwsCredentials {
+            access_key_id: "dummy-access-key".to_string(),
+            secret_access_key: "dummy-secret-key".to_string(),
+            session_token: None,
+        });
+    }
+    if let (Some(access_key_id), Some(secret_access_key)) =
+        (env("AWS_ACCESS_KEY_ID"), env("AWS_SECRET_ACCESS_KEY"))
+    {
+        return Some(AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token: env("AWS_SESSION_TOKEN"),
+        });
+    }
+    let profile = profile
+        .map(std::string::ToString::to_string)
+        .or_else(|| env("AWS_PROFILE"))
+        .unwrap_or_else(|| "default".to_string());
+    let paths = aws_file_paths(env, pa_types::platform::home_dir().as_deref());
+    if let Some(credentials_path) = &paths.credentials {
+        let shared = tokio::fs::read_to_string(credentials_path)
+            .await
+            .ok()
+            .and_then(|text| parse_ini_credentials(&text, &profile));
+        if shared.is_some() {
+            return shared;
+        }
+    }
+    let config = tokio::fs::read_to_string(paths.config?).await.ok()?;
+    crate::providers::bedrock::credential_process::credentials_from_process(&profile, &config).await
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// UTC timestamp in `SigV4` formats: `x-amz-date` (20250101T000000Z) and date stamp (20250101).
+/// Uses std time to avoid a chrono dependency.
+fn utc_parts(seconds: u64) -> (String, String) {
+    let (year, month, day, hour, minute, second) = civil_from_unix(seconds);
+    (
+        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
+        format!("{year:04}{month:02}{day:02}"),
+    )
+}
+
+/// Convert a Unix timestamp to civil UTC date-time (Howard Hinnant's algorithm).
+fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    // u64::MAX / 86_400 is ~2.1e14; the day count always fits i64.
+    let days = i64::try_from(secs / 86_400).expect("days since the epoch fit i64");
+    let secs_of_day = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    // Howard Hinnant's algorithm: day 1..=31, month 1..=12 for any input day count.
+    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).expect("day of month is 1..=31");
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).expect("month is 1..=12");
+    let year = if m <= 2 { y + 1 } else { y };
+    (
+        year,
+        m,
+        d,
+        (secs_of_day / 3600) as u32,
+        ((secs_of_day % 3600) / 60) as u32,
+        (secs_of_day % 60) as u32,
+    )
+}
+
+/// Produce the `SigV4` auth headers for a request. Returns `(x-amz-date, authorization,
+/// x-amz-security-token)`.
+pub struct SigV4Params<'a> {
+    pub method: &'a str,
+    /// Request path, starting with `/`; signed requests carry no query string.
+    pub path: &'a str,
+    pub host: &'a str,
+    pub region: &'a str,
+    pub service: &'a str,
+    pub body: &'a [u8],
+    /// Extra headers included in the signed header list (lowercase names).
+    pub extra_signed_headers: &'a [(String, String)],
+}
+
+/// Percent-encode every byte outside the `SigV4` unreserved set (`/` kept as the separator).
+fn uri_encode_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.bytes() {
+        let c = byte as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/') {
+            encoded.push(c);
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+/// The `SigV4` canonical request: method, canonical URI, an empty canonical query string (signed
+/// requests carry none), the canonical headers, a blank line, the signed header names and the body
+/// hash.
+/// Every service except S3 encodes the already-escaped request path a second time, so a model id
+/// sent as `...v1%3A0` is signed as `...v1%253A0`.
+fn canonical_request(
+    method: &str,
+    path: &str,
+    canonical_headers_text: &str,
+    signed_headers: &str,
+    payload_hash: &str,
+) -> String {
+    let canonical_uri = uri_encode_path(path);
+    format!(
+        "{method}\n{canonical_uri}\n\n{canonical_headers_text}\n{signed_headers}\n{payload_hash}"
+    )
+}
+
+/// Produce the `SigV4` auth headers for a request. Returns `(x-amz-date, authorization,
+/// x-amz-security-token)`.
+pub fn sigv4_headers(
+    params: &SigV4Params<'_>,
+    credentials: &AwsCredentials,
+) -> (String, String, Option<String>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    sigv4_headers_at(params, credentials, now)
+}
+
+/// [`sigv4_headers`] for a fixed signing time (Unix seconds).
+fn sigv4_headers_at(
+    params: &SigV4Params<'_>,
+    credentials: &AwsCredentials,
+    unix_seconds: u64,
+) -> (String, String, Option<String>) {
+    let (amz_date, date_stamp) = utc_parts(unix_seconds);
+    let payload_hash = sha256_hex(params.body);
+
+    let mut canonical_headers: Vec<(String, String)> = vec![
+        ("content-type".to_string(), "application/json".to_string()),
+        ("host".to_string(), params.host.to_string()),
+        ("x-amz-date".to_string(), amz_date.clone()),
+    ];
+    for (name, value) in params.extra_signed_headers {
+        // Canonical header values are trimmed with inner whitespace runs collapsed.
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        canonical_headers.push((name.to_lowercase(), value));
+    }
+    if let Some(token) = &credentials.session_token {
+        canonical_headers.push(("x-amz-security-token".to_string(), token.clone()));
+    }
+    canonical_headers.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let signed_headers = canonical_headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers_text =
+        canonical_headers
+            .iter()
+            .fold(String::new(), |mut text, (name, value)| {
+                let _ = writeln!(text, "{name}:{value}");
+                text
+            });
+
+    let canonical_request = canonical_request(
+        params.method,
+        params.path,
+        &canonical_headers_text,
+        &signed_headers,
+        &payload_hash,
+    );
+
+    let credential_scope = format!(
+        "{}/{}/{}/aws4_request",
+        date_stamp, params.region, params.service
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+
+    let date_key = hmac_sha256(
+        format!("AWS4{}", credentials.secret_access_key).as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let region_key = hmac_sha256(&date_key, params.region.as_bytes());
+    let service_key = hmac_sha256(&region_key, params.service.as_bytes());
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        credentials.access_key_id, credential_scope, signed_headers, signature
+    );
+
+    (amz_date, authorization, credentials.session_token.clone())
+}
+
+pub fn get_configured_bedrock_region(region: Option<&str>) -> Option<String> {
+    region
+        .map(std::string::ToString::to_string)
+        .or_else(|| env("AWS_REGION"))
+        .or_else(|| env("AWS_DEFAULT_REGION"))
+}
+
+pub fn has_configured_bedrock_profile() -> bool {
+    env("AWS_PROFILE").is_some()
+}
+
+pub fn get_standard_bedrock_endpoint_region(base_url: &str) -> Option<String> {
+    let hostname = url::Url::parse(base_url).ok()?.host_str()?.to_lowercase();
+    let suffix_stripped = hostname
+        .strip_prefix("bedrock-runtime-fips")
+        .or_else(|| hostname.strip_prefix("bedrock-runtime"))?;
+    let rest = suffix_stripped.strip_prefix('.')?;
+    let region = rest
+        .strip_suffix(".amazonaws.com")
+        .or_else(|| rest.strip_suffix(".amazonaws.com.cn"))?;
+    if region.is_empty()
+        || !region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    Some(region.to_string())
+}
+
+pub fn should_use_explicit_bedrock_endpoint(
+    base_url: &str,
+    configured_region: Option<&str>,
+    has_configured_profile: bool,
+) -> bool {
+    let endpoint_region = get_standard_bedrock_endpoint_region(base_url);
+    match endpoint_region {
+        None => true,
+        Some(_) => configured_region.is_none() && !has_configured_profile,
+    }
+}
+
+/// Resolve the request endpoint and region: explicit model baseUrl (custom gateways, fips,
+/// `GovCloud`) or the standard regional endpoint.
+pub(crate) fn resolve_endpoint(model: &Model, options: &BedrockOptions) -> (String, String) {
+    let configured_region = get_configured_bedrock_region(options.region.as_deref());
+    let has_profile = has_configured_bedrock_profile();
+    let use_explicit_endpoint = should_use_explicit_bedrock_endpoint(
+        &model.base_url,
+        configured_region.as_deref(),
+        has_profile,
+    );
+
+    if use_explicit_endpoint && !model.base_url.is_empty() {
+        // Region resolution mirrors the TS: explicit option > env vars > endpoint hostname >
+        // (profile-resolved) > us-east-1.
+        let region = configured_region
+            .or_else(|| {
+                crate::providers::bedrock::auth::get_standard_bedrock_endpoint_region(
+                    &model.base_url,
+                )
+            })
+            .or_else(|| env_region_or_profile(env, pa_types::platform::home_dir().as_deref()))
+            .unwrap_or_else(|| "us-east-1".to_string());
+        return (model.base_url.trim_end_matches('/').to_string(), region);
+    }
+
+    let region = configured_region
+        .or_else(|| env_region_or_profile(env, pa_types::platform::home_dir().as_deref()))
+        .unwrap_or_else(|| "us-east-1".to_string());
+    (
+        format!("https://bedrock-runtime.{region}.amazonaws.com"),
+        region,
+    )
+}
+
+/// `AWS_REGION` / `AWS_DEFAULT_REGION` from `lookup`, else the `AWS_PROFILE` region from the AWS
+/// config file (`AWS_CONFIG_FILE` or `~/.aws/config`), else None.
+fn env_region_or_profile(
+    lookup: impl Fn(&str) -> Option<String>,
+    home: Option<&Path>,
+) -> Option<String> {
+    if let Some(region) = lookup("AWS_REGION").or_else(|| lookup("AWS_DEFAULT_REGION")) {
+        return Some(region);
+    }
+    let profile = lookup("AWS_PROFILE")?;
+    let text = std::fs::read_to_string(aws_file_paths(&lookup, home).config?).ok()?;
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let name = trimmed[1..trimmed.len() - 1].trim();
+            in_section = name == format!("profile {profile}") || name == profile;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == "region" {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod sigv4_tests {
+    use super::*;
+
+    const PATH: &str = "/model/anthropic.claude-3-5-haiku-20241022-v1%3A0/converse-stream";
+    /// 2015-08-30T12:36:00Z.
+    const SIGNED_AT: u64 = 1_440_938_160;
+
+    fn example_credentials(session_token: Option<&str>) -> AwsCredentials {
+        AwsCredentials {
+            access_key_id: "AKIDEXAMPLE".into(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            session_token: session_token.map(str::to_string),
+        }
+    }
+
+    fn sign(
+        extra_signed_headers: &[(String, String)],
+        session_token: Option<&str>,
+    ) -> (String, String, Option<String>) {
+        sigv4_headers_at(
+            &SigV4Params {
+                method: "POST",
+                path: PATH,
+                host: "bedrock-runtime.us-east-1.amazonaws.com",
+                region: "us-east-1",
+                service: "bedrock",
+                body: br#"{"messages":[]}"#,
+                extra_signed_headers,
+            },
+            &example_credentials(session_token),
+            SIGNED_AT,
+        )
+    }
+
+    /// Expected values come from botocore's `SigV4Auth` signing the same request at the same time.
+    #[test]
+    fn signature_matches_the_aws_sdk_for_a_converse_stream_request() {
+        assert_eq!(
+            sign(&[], None),
+            (
+                "20150830T123600Z".to_string(),
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=2b962e4a0a2957cde2764ba8f78dae35436939649a081a25a45c3bd64dfe16d2".to_string(),
+                None,
+            )
+        );
+    }
+
+    /// Same request with a session token and the request-metadata header (whose value botocore
+    /// canonicalizes by collapsing inner whitespace runs).
+    #[test]
+    fn signature_matches_the_aws_sdk_with_a_session_token_and_metadata_header() {
+        let metadata = vec![(
+            "x-amzn-bedrock-request-metadata".to_string(),
+            r#"{"team":  "a"}"#.to_string(),
+        )];
+        assert_eq!(
+            sign(&metadata, Some("session-token")),
+            (
+                "20150830T123600Z".to_string(),
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amzn-bedrock-request-metadata, Signature=607ee2b6778ba42dc6f50e8aa52b419c3aa6eaeb0d4ef441787fcb6a3b2cdb15".to_string(),
+                Some("session-token".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_request_has_an_empty_query_line_and_double_encodes_the_path() {
+        assert_eq!(
+            canonical_request("POST", PATH, "host:example\n", "host", "abc"),
+            "POST\n/model/anthropic.claude-3-5-haiku-20241022-v1%253A0/converse-stream\n\nhost:example\n\nhost\nabc"
+        );
+    }
+}
+
+#[cfg(test)]
+mod file_path_tests {
+    use super::*;
+
+    #[test]
+    fn file_overrides_apply_with_or_without_a_home_directory() {
+        let overrides = |var: &str| match var {
+            "AWS_SHARED_CREDENTIALS_FILE" => Some("/etc/aws/credentials".to_string()),
+            "AWS_CONFIG_FILE" => Some("/etc/aws/config".to_string()),
+            _ => None,
+        };
+        let unset = |_: &str| None;
+        let home = Path::new("/home/user");
+        let overridden = AwsFilePaths {
+            credentials: Some("/etc/aws/credentials".into()),
+            config: Some("/etc/aws/config".into()),
+        };
+
+        assert_eq!(
+            [
+                aws_file_paths(overrides, None),
+                aws_file_paths(overrides, Some(home)),
+                aws_file_paths(unset, Some(home)),
+                aws_file_paths(unset, None),
+            ],
+            [
+                overridden,
+                AwsFilePaths {
+                    credentials: Some("/etc/aws/credentials".into()),
+                    config: Some("/etc/aws/config".into()),
+                },
+                AwsFilePaths {
+                    credentials: Some("/home/user/.aws/credentials".into()),
+                    config: Some("/home/user/.aws/config".into()),
+                },
+                AwsFilePaths {
+                    credentials: None,
+                    config: None,
+                },
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    #[test]
+    fn the_profile_region_comes_from_the_config_file_override_without_a_home_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config");
+        std::fs::write(
+            &config,
+            "[default]\nregion = us-east-1\n\n[profile work]\nregion = eu-central-1\n",
+        )
+        .expect("write config");
+        let config = config.display().to_string();
+        let lookup = |var: &str| match var {
+            "AWS_PROFILE" => Some("work".to_string()),
+            "AWS_CONFIG_FILE" => Some(config.clone()),
+            _ => None,
+        };
+        let empty_home = dir.path().join("home");
+
+        assert_eq!(
+            [
+                env_region_or_profile(lookup, None),
+                env_region_or_profile(lookup, Some(&empty_home)),
+            ],
+            [
+                Some("eu-central-1".to_string()),
+                Some("eu-central-1".to_string())
+            ]
+        );
+    }
+}

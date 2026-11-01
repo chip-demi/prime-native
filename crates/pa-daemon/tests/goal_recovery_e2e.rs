@@ -1,0 +1,662 @@
+//! Durable `thread_goal_state` persistence (the #238 durability gap): the
+//! session file carries the `thread_goal_state` rows a started goal writes,
+//! and a worker killed mid-goal rebuilds with the goal rehydrated — objective,
+//! usage counters, and continuation count from the durable rows, not a fresh engine.
+#![allow(clippy::large_futures)]
+// 64-bit-only targets; the narrowing casts sit at bounded OS boundaries.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+// Fn length is a style gate, not correctness.
+#![allow(clippy::too_many_lines)]
+// API-shape opinions, not defects; the surfaces are deliberate.
+#![allow(
+    clippy::unnecessary_wraps,
+    clippy::zero_sized_map_values,
+    clippy::struct_excessive_bools,
+    clippy::struct_field_names
+)]
+#![cfg(unix)]
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+const GOAL_STATE_CUSTOM_TYPE: &str = "thread_goal_state";
+const OBJECTIVE: &str = "ship the goal-recovery port";
+
+struct Supervisor {
+    child: Child,
+    #[allow(dead_code)]
+    socket: PathBuf,
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[allow(clippy::zombie_processes)]
+fn spawn_supervisor(socket: &Path, agent_dir: &Path) -> Supervisor {
+    std::fs::create_dir_all(agent_dir).expect("agent dir");
+    let child = Command::new(env!("CARGO_BIN_EXE_pa-daemon"))
+        .arg("supervisor")
+        .arg("--socket")
+        .arg(socket)
+        .arg("--agent-dir")
+        .arg(agent_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("PRIME_API_KEY")
+        .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
+        // A supervisor killed at teardown must not leak session workers (the supervisor-lost
+        // exit runs here).
+        .env(
+            pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+            "15000",
+        )
+        .spawn()
+        .expect("spawn pa-daemon supervisor");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if socket.exists() {
+            return Supervisor {
+                child,
+                socket: socket.to_path_buf(),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("supervisor socket never appeared");
+}
+
+/// One client connection: request/response plus the session events that stream while a response is
+/// outstanding.
+struct Client {
+    reader: BufReader<std::os::unix::net::UnixStream>,
+    writer: std::os::unix::net::UnixStream,
+    events: Vec<Value>,
+}
+
+impl Client {
+    fn connect(socket: &Path) -> Client {
+        let stream = std::os::unix::net::UnixStream::connect(socket).expect("connect");
+        let writer = stream.try_clone().expect("clone");
+        let mut client = Client {
+            reader: BufReader::new(stream),
+            writer,
+            events: Vec::new(),
+        };
+        let hello = client.read_line();
+        assert_eq!(hello["type"], "daemon_hello");
+        client
+    }
+
+    fn read_line(&mut self) -> Value {
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_mins(5);
+        self.reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("timeout");
+        loop {
+            match self.reader.read_line(&mut line) {
+                Ok(0) => panic!("supervisor closed the connection"),
+                Ok(_) if line.trim().is_empty() => line.clear(),
+                Ok(_) => return serde_json::from_str(line.trim()).expect("parse line"),
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for supervisor line: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn send_command(&mut self, id: &str, command: &Value) {
+        let envelope = json!({
+            "type": "command",
+            "id": id,
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "command": command,
+        });
+        let mut line = serde_json::to_string(&envelope).expect("serialize");
+        line.push('\n');
+        self.writer
+            .write_all(line.as_bytes())
+            .unwrap_or_else(|error| panic!("write command {id}: {error}"));
+    }
+
+    fn request(&mut self, id: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_mins(5);
+        loop {
+            assert!(Instant::now() < deadline, "no response for id {id}");
+            let line = self.read_line();
+            if line.get("id").and_then(Value::as_str) == Some(id) {
+                return line;
+            }
+            self.collect_event(&line);
+        }
+    }
+
+    fn collect_event(&mut self, line: &Value) {
+        if line.get("type").and_then(Value::as_str) == Some("session_event") {
+            self.events.push(line["event"].clone());
+        }
+    }
+
+    fn drain_events(&mut self, quiet_ms: Duration) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last_line = Instant::now();
+        let mut line = String::new();
+        loop {
+            assert!(Instant::now() < deadline, "event drain timed out");
+            self.reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("timeout");
+            match self.reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {
+                    let value: Value = serde_json::from_str(line.trim()).expect("parse line");
+                    self.collect_event(&value);
+                    last_line = Instant::now();
+                    line.clear();
+                }
+                Err(_) => {
+                    if last_line.elapsed() >= quiet_ms {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The harness: a supervisor, a faux-scripted session over the real engine (compaction with a tiny
+/// keep window), and the session file the durable rows land in.
+struct Harness {
+    dir: tempfile::TempDir,
+    _supervisor: Supervisor,
+    client: Client,
+    session_id: String,
+}
+
+fn setup(name: &str) -> Harness {
+    setup_with_response_count(name, 16)
+}
+
+fn setup_with_response_count(name: &str, response_count: usize) -> Harness {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    // A tiny keep window: the manual compact always has a cut, so the post-compaction
+    // goal-continue branch runs (the mint that bumps `continuationsUsed` durably).
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({
+            "compaction": { "enabled": true, "keepRecentTokens": 10, "reserveTokens": 100 }
+        })
+        .to_string(),
+    )
+    .expect("write settings");
+    let responses: Vec<Value> = (0..response_count)
+        .map(|index| json!({ "text": format!("scripted reply {index}") }))
+        .collect();
+    let script = dir.path().join("faux.json");
+    std::fs::write(
+        &script,
+        json!({
+                    "engine": "faux",
+        // The goal-continuation loop mints one continuation per natural turn end while the
+        // goal is ACTIVE — unbounded churn, so a finite script can run dry mid-flow (registered
+        // red red-goal-recovery-faux-exhaustion-20260926-1). The repeat-last knob opts out.
+                    "repeatLastResponse": true,
+                    "responses": responses,
+                })
+        .to_string(),
+    )
+    .expect("write faux script");
+    let socket = dir.path().join(format!("{name}.sock"));
+    let supervisor = spawn_supervisor(&socket, &agent_dir);
+    let mut client = Client::connect(&socket);
+    client.send_command(
+        "c1",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": session_dir.to_string_lossy(),
+                "script": script.to_string_lossy(),
+                "name": name,
+            },
+        }),
+    );
+    let created = client.request("c1");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let session_id = created["data"]["activeSessionId"]
+        .as_str()
+        .or_else(|| created["data"]["id"].as_str())
+        .expect("active session id")
+        .to_string();
+    // Session events only reach attached wire clients; attach for the `goal_update` announcements.
+    client.send_command(
+        "a1",
+        &json!({ "type": "attach", "activeSessionId": session_id }),
+    );
+    let attached = client.request("a1");
+    assert_eq!(attached["success"], true, "attach failed: {attached}");
+    Harness {
+        dir,
+        _supervisor: supervisor,
+        client,
+        session_id,
+    }
+}
+
+impl Harness {
+    fn session_file(&self) -> PathBuf {
+        let session_dir = self.dir.path().join("agent").join("sessions");
+        std::fs::read_dir(&session_dir)
+            .expect("session dir readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .expect("one session file")
+    }
+
+    /// The session file's `thread_goal_state` custom rows, in file order.
+    fn goal_state_rows(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.session_file())
+            .expect("session file readable")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .filter(|entry| {
+                entry.get("type").and_then(Value::as_str) == Some("custom")
+                    && entry.get("customType").and_then(Value::as_str)
+                        == Some(GOAL_STATE_CUSTOM_TYPE)
+            })
+            .collect()
+    }
+
+    fn latest_goal_row(&self) -> Value {
+        self.goal_state_rows()
+            .last()
+            .cloned()
+            .unwrap_or(Value::Null)["data"]
+            .clone()
+    }
+
+    fn prompt(&mut self, id: &str, message: &str) {
+        self.client.send_command(
+            id,
+            &json!({
+                "type": "prompt_and_wait",
+                "activeSessionId": self.session_id,
+                "message": message,
+            }),
+        );
+        let done = self.client.request(id);
+        assert_eq!(done["success"], true, "prompt {id} failed: {done}");
+        self.client.drain_events(Duration::from_secs(1));
+    }
+
+    /// The f18-battery prompt form: send and wait without the quiet drain — the goal-continuation
+    /// loop keeps the socket from ever going quiet.
+    fn prompt_racing_the_loop(&mut self, id: &str, message: &str) {
+        self.client.send_command(
+            id,
+            &json!({
+                "type": "prompt_and_wait",
+                "activeSessionId": self.session_id,
+                "message": message,
+            }),
+        );
+        let done = self.client.request(id);
+        assert_eq!(done["success"], true, "prompt {id} failed: {done}");
+    }
+
+    /// The bounded event wait: read streaming events until one matches `predicate` (the deadline
+    /// catches a stall) — the quiet `drain_events` cannot observe a mid-churn moment.
+    fn wait_for_event(&mut self, what: &str, predicate: impl Fn(&Value) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut line = String::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the session never streamed {what}: {:?}",
+                self.client.events
+            );
+            self.client
+                .reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("timeout");
+            match self.client.reader.read_line(&mut line) {
+                Ok(0) => panic!("supervisor closed the connection"),
+                Ok(_) if line.trim().is_empty() => {
+                    line.clear();
+                }
+                Ok(_) => {
+                    let value: Value = serde_json::from_str(line.trim()).expect("parse line");
+                    line.clear();
+                    let matched = value.get("type").and_then(Value::as_str)
+                        == Some("session_event")
+                        && predicate(&value["event"]);
+                    self.client.collect_event(&value);
+                    if matched {
+                        return;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    fn announced_continuations(&self) -> Vec<u64> {
+        self.client
+            .events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("goal_update"))
+            .filter_map(|event| event["goal"]["continuationsUsed"].as_u64())
+            .collect()
+    }
+}
+
+#[test]
+fn killed_mid_goal_worker_rehydrates_the_goal_with_counts() {
+    let mut harness = setup("goal-recovery");
+
+    // A started goal persists as a `thread_goal_state` row; the start turn's mint makes the durable
+    // count at least 1.
+    harness.prompt_racing_the_loop("g1", &format!("/goal {OBJECTIVE}"));
+    // Pause immediately (the f18 battery pattern): the purge withdraws the queued continuation.
+    harness.prompt_racing_the_loop("g2", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
+    let goal = harness.latest_goal_row();
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
+    assert_eq!(goal["objective"], OBJECTIVE);
+    let pre_seed_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        pre_seed_count >= 1,
+        "the start turn never minted a continuation: {goal}"
+    );
+
+    // Seed work turns so the manual compact has a cut (the goal is paused: nothing mints).
+    harness.prompt("s1", "first work turn for the cut");
+    harness.prompt("s2", "second work turn for the cut");
+    let goal = harness.latest_goal_row();
+    assert_eq!(
+        goal["continuationsUsed"].as_u64().unwrap(),
+        pre_seed_count,
+        "a paused goal consumed continuation slots: {goal}"
+    );
+
+    // Resume, then pause again before the loop churns: the resumed driver runs
+    // its continuation turn and the pause keeps the queue quiet.
+    harness.prompt_racing_the_loop("r0", "/goal resume");
+    harness.prompt_racing_the_loop("r0p", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
+    let goal = harness.latest_goal_row();
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
+    let pre_compact_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        pre_compact_count > pre_seed_count,
+        "the resume never minted: {goal}"
+    );
+
+    // The compact mints the owed continuation on the reactivated goal: resume, compact, pause — the
+    // minted count is durable.
+    harness.prompt_racing_the_loop("r1", "/goal resume");
+    harness.client.send_command(
+        "c2",
+        &json!({ "type": "compact", "activeSessionId": harness.session_id }),
+    );
+    let compact = harness.client.request("c2");
+    assert_eq!(compact["success"], true, "compact failed: {compact}");
+    harness.prompt_racing_the_loop("p3", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
+    harness.client.send_command(
+        "w2",
+        &json!({ "type": "wait_for_idle", "activeSessionId": harness.session_id }),
+    );
+    let idle = harness.client.request("w2");
+    assert_eq!(idle["success"], true, "never went idle: {idle}");
+    harness.client.drain_events(Duration::from_secs(1));
+    assert!(
+        harness
+            .announced_continuations()
+            .iter()
+            .any(|count| *count > pre_compact_count),
+        "the compact mint never announced a higher count: {:?}",
+        harness.client.events
+    );
+    let goal = harness.latest_goal_row();
+    let pre_kill_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        pre_kill_count > pre_compact_count,
+        "the compact never minted a durable continuation: {goal}"
+    );
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
+
+    harness.client.send_command(
+        "st1",
+        &json!({ "type": "get_state", "activeSessionId": harness.session_id }),
+    );
+    let state = harness.client.request("st1");
+    assert_eq!(state["success"], true, "get_state failed: {state}");
+    let worker_pid = state["data"]["workerPid"].as_u64().expect("worker pid");
+    let pre_kill_rows = harness.goal_state_rows().len();
+    let pre_kill_events = harness.client.events.len();
+
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &worker_pid.to_string()])
+        .status();
+    std::thread::sleep(Duration::from_secs(3));
+
+    // The recovered prompt retries until the new worker serves it (attempts race the
+    // respawn backoff).
+    let deadline = Instant::now() + Duration::from_mins(3);
+    let recovered = loop {
+        assert!(Instant::now() < deadline, "the session never recovered");
+        harness.client.send_command(
+            "rp",
+            &json!({
+                "type": "prompt_and_wait",
+                "activeSessionId": harness.session_id,
+                "message": "keep working after the crash",
+            }),
+        );
+        let done = harness.client.request("rp");
+        if done["success"] == true {
+            break done;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(
+        recovered["success"], true,
+        "recovery prompt failed: {recovered}"
+    );
+    harness.client.drain_events(Duration::from_secs(1));
+
+    // The rebuilt worker answers with the rehydrated goal, never a fresh engine's empty state.
+    harness.client.send_command(
+        "st2",
+        &json!({
+            "type": "get_connection_state",
+            "activeSessionId": harness.session_id,
+        }),
+    );
+    let connection = harness.client.request("st2");
+    assert_eq!(
+        connection["success"], true,
+        "get_connection_state failed: {connection}"
+    );
+    let goal = &connection["data"]["goal"];
+    assert_eq!(
+        goal["status"], "paused",
+        "connection state goal: {connection}"
+    );
+    assert_eq!(goal["objective"], OBJECTIVE);
+    assert_eq!(
+        goal["continuationsUsed"].as_u64().unwrap(),
+        pre_kill_count,
+        "connection state goal: {connection}"
+    );
+    // Creation-based timer (operator ruling 2026-09-28): `timeUsedSeconds` is the
+    // goal's age since `createdAt`, computed fresh on every read — never an accumulating
+    // counter (the pre-ruling compounding read hours).
+    assert!(
+        goal["createdAt"].is_u64(),
+        "the served goal carries its creation time: {connection}"
+    );
+    let served_age = goal["timeUsedSeconds"].as_u64().unwrap();
+    assert!(
+        served_age < 600,
+        "a minutes-old goal reads its age, not folded hours: {connection}"
+    );
+    let durable_row = harness.latest_goal_row();
+    assert!(
+        durable_row["timeUsedSeconds"].as_u64().unwrap() < 600,
+        "the durable rows carry the age at write: {durable_row}"
+    );
+    let recovery_announcements: Vec<u64> = harness.client.events[pre_kill_events..]
+        .iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("goal_update"))
+        .filter_map(|event| event["goal"]["continuationsUsed"].as_u64())
+        .collect();
+    assert!(
+        recovery_announcements
+            .iter()
+            .all(|count| *count >= pre_kill_count),
+        "a post-recovery announcement reset the count: {recovery_announcements:?}"
+    );
+
+    // A resumed turn's accounting continues from the rehydrated base.
+    harness.prompt_racing_the_loop("rr", "/goal resume");
+    harness.prompt_racing_the_loop("rrp", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
+    assert!(
+        harness.goal_state_rows().len() > pre_kill_rows,
+        "the recovery wrote no new durable goal rows"
+    );
+    let goal = harness.latest_goal_row();
+    assert!(
+        goal["continuationsUsed"].as_u64().unwrap() >= pre_kill_count,
+        "a post-recovery turn reset the durable count: {goal}"
+    );
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
+    assert_eq!(goal["objective"], OBJECTIVE);
+    assert!(
+        goal["tokensUsed"].as_u64().unwrap() > 0,
+        "usage accounting never continued: {goal}"
+    );
+
+    // The post-recovery compact runs over the durable history (TS one-store recovery, #243):
+    // the walk sees the pre-crash conversation, never the fresh engine's empty branch.
+    let pre_final_count = harness.latest_goal_row()["continuationsUsed"]
+        .as_u64()
+        .unwrap();
+    harness.prompt_racing_the_loop("rf", "/goal resume");
+    harness.client.send_command(
+        "c3",
+        &json!({ "type": "compact", "activeSessionId": harness.session_id }),
+    );
+    let compact = harness.client.request("c3");
+    assert_eq!(
+        compact["success"], true,
+        "the post-recovery compact skipped on an empty branch: {compact}"
+    );
+    harness.prompt_racing_the_loop("rfp", "/goal pause");
+    harness.client.send_command(
+        "w3",
+        &json!({ "type": "wait_for_idle", "activeSessionId": harness.session_id }),
+    );
+    let idle = harness.client.request("w3");
+    assert_eq!(idle["success"], true, "never went idle: {idle}");
+    harness.client.drain_events(Duration::from_secs(1));
+
+    let compaction_rows = std::fs::read_to_string(harness.session_file())
+        .expect("session file readable")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| line.contains("\"type\":\"compaction\""))
+        .count();
+    assert!(
+        compaction_rows >= 2,
+        "the post-recovery compact never persisted a second compaction entry"
+    );
+    let goal = harness.latest_goal_row();
+    let post_final_count = goal["continuationsUsed"].as_u64().unwrap();
+    assert!(
+        post_final_count > pre_final_count,
+        "the post-recovery compact never minted off the rehydrated count: {goal}"
+    );
+    assert_eq!(goal["status"], "paused", "durable goal row: {goal}");
+    assert_eq!(goal["objective"], OBJECTIVE);
+    assert!(
+        harness
+            .announced_continuations()
+            .contains(&post_final_count),
+        "the post-recovery mint never announced continuationsUsed {post_final_count}: {:?}",
+        harness.client.events
+    );
+}
+
+/// Deterministic-red regression for the registered flake
+/// `red-goal-recovery-faux-exhaustion-20260926-1`: the goal-continuation loop's unbounded
+/// churn can empty a finite script queue mid-flow; the last scripted reply's `message_end`
+/// is the witness.
+#[test]
+fn repeat_last_script_stays_answerable_once_the_goal_churn_empties_it() {
+    // Five genuine queue items require one real ten-second cadence wake before
+    // automatic exhaustion. Human input below must remain answerable past that
+    // finite queue; no clock or cadence bypass is used.
+    let response_count = 5;
+    let last_reply = format!("scripted reply {}", response_count - 1);
+    let mut harness = setup_with_response_count("goal-recovery-exhaustion", response_count);
+
+    harness.prompt_racing_the_loop("g1", &format!("/goal {OBJECTIVE}"));
+    harness.wait_for_event("the last scripted reply", |event| {
+        event.get("type").and_then(Value::as_str) == Some("message_end")
+            && serde_json::to_string(event)
+                .unwrap_or_default()
+                .contains(&last_reply)
+    });
+
+    // The final queue item follows the real durable scheduler wake, not a
+    // fixture-injected prompt. Preserve its internal provenance in history.
+    let history = std::fs::read_to_string(harness.session_file()).expect("session history");
+    assert!(
+        history
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|row| {
+                row["type"] == "custom_message"
+                    && row["customType"] == "goal_backoff_wake"
+                    && row["details"]["source"] == "goal_backoff_wake"
+                    && row["details"]["label"] == "goal-backoff-wake"
+                    && row["details"]["jobId"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty())
+            }),
+        "automatic exhaustion must cross a genuine persisted goal backoff wake"
+    );
+
+    harness.prompt_racing_the_loop("x1", "keep working past the scripted depth");
+    // A quiet teardown: the pause withdraws the minted continuation before the harness drops.
+    harness.prompt_racing_the_loop("x2", "/goal pause");
+    harness.client.drain_events(Duration::from_secs(1));
+}
