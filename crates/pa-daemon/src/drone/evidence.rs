@@ -240,6 +240,149 @@ mod tests {
     use crate::drone::registry::DroneRegistry;
 
     #[test]
+    fn terminal_roster_distinguishes_unavailable_idle_and_completed() {
+        assert_eq!(terminal_children(None), json!({"state":"unavailable"}));
+        assert_eq!(
+            terminal_children(Some(&json!({"unavailable":true}))),
+            json!({"state":"unavailable"})
+        );
+        let empty = terminal_children(Some(&json!({"eventSequence":1,"children":[]})));
+        let result = terminal_children(Some(&json!({"eventSequence":1,"children":[
+            {"id":"idle","status":"running","executionStatus":"idle"},
+            {"id":"active","status":"running","executionStatus":"active"}
+        ]})));
+        let mut expected = empty;
+        expected["idleAssignments"] = json!([{"id":"idle","assignmentStatus":"running",
+            "executionStatus":"idle","result":"unconfirmed"}]);
+        assert_eq!(result, expected);
+        assert_eq!(result["state"], "available");
+        assert_eq!(result["count"], 0);
+    }
+
+    #[test]
+    fn terminal_rendering_bounds_text_but_fingerprints_omitted_outcomes() {
+        let text = "界".repeat(400);
+        let mut children = json!({"eventSequence":1,"children":(0..5).map(|index| json!({
+            "id":format!("child-{index}"),"status":"error","answerPreview":text,"error":text
+        })).collect::<Vec<_>>()});
+        let result = terminal_children(Some(&children));
+        assert_eq!(result["count"], 5);
+        assert_eq!(result["omitted"], 1);
+        assert_eq!(result["selected"].as_array().unwrap().len(), 4);
+        for row in result["selected"].as_array().unwrap() {
+            assert_eq!(row["answerPreview"], "界".repeat(384));
+            assert_eq!(row["error"], "界".repeat(384));
+        }
+        children["children"][0]["error"] = json!("changed omitted outcome");
+        let changed = terminal_children(Some(&children));
+        assert_eq!(changed["selected"], result["selected"]);
+        assert_ne!(changed["fingerprint"], result["fingerprint"]);
+        children["children"].as_array_mut().unwrap().reverse();
+        assert_eq!(
+            terminal_children(Some(&children))["fingerprint"],
+            changed["fingerprint"]
+        );
+    }
+
+    #[test]
+    fn unresolved_causes_are_independent_and_do_not_label_dependency_wait_as_stall() {
+        let snapshot =
+            json!({"request":null,"tools":[],"hasBackgroundBash":false,"compacting":false});
+        let closed = json!({"structured":{"steps":[{"status":"verified"}]}});
+        let open =
+            json!({"structured":{"steps":[{"status":"blocked","dependencies":["prerequisite"]}]}});
+        let gate = json!({"unknown":0,"nextWork":{"runtime":{"awaitingAcceptance":[]}}});
+        let children = json!({"children":[]});
+        assert!(!model_state(&snapshot, &closed, Some(&gate), Some(&children), None).unresolved);
+        for unknown in [json!(1), Value::Null] {
+            let mut changed = gate.clone();
+            changed["unknown"] = unknown;
+            assert!(
+                model_state(&snapshot, &closed, Some(&changed), Some(&children), None).unresolved
+            );
+        }
+        let mut awaiting = gate.clone();
+        awaiting["nextWork"]["runtime"]["awaitingAcceptance"] = json!([{"id":"result"}]);
+        assert!(model_state(&snapshot, &closed, Some(&awaiting), Some(&children), None).unresolved);
+        for (execution, unresolved) in [("active", false), ("idle", true)] {
+            let child =
+                json!({"children":[{"id":"child","status":"running","executionStatus":execution}]});
+            assert_eq!(
+                model_state(&snapshot, &closed, Some(&gate), Some(&child), None).unresolved,
+                unresolved
+            );
+        }
+        for (elapsed, unresolved) in [(99, false), (100, true)] {
+            let mut transport = snapshot.clone();
+            transport["request"] = json!({"requestId":1,"revision":1,"phase":"transport","deadlineMs":100,"elapsedMs":elapsed});
+            assert_eq!(
+                model_state(&transport, &closed, Some(&gate), Some(&children), None).unresolved,
+                unresolved
+            );
+        }
+        assert!(model_state(&snapshot, &open, Some(&gate), Some(&children), None).unresolved);
+        for change in [
+            json!({"tools":["owned-job"]}),
+            json!({"hasBackgroundBash":true}),
+            json!({"compacting":true}),
+            json!({"request":{"phase":"model"}}),
+        ] {
+            let mut busy = snapshot.clone();
+            for (key, value) in change.as_object().unwrap() {
+                busy[key] = value.clone();
+            }
+            assert!(!model_state(&busy, &open, Some(&gate), Some(&children), None).unresolved);
+        }
+    }
+
+    #[test]
+    fn blocked_plan_repeats_are_stable_but_real_outcomes_and_readiness_are_material() {
+        let snapshot =
+            json!({"request":null,"tools":[],"hasBackgroundBash":false,"compacting":false});
+        let mut roadmap = json!({"structured":{"revision":1,"steps":[{"id":"task","status":"blocked","dependencies":["prerequisite"]}]}});
+        let gate = json!({"unknown":0,"nextWork":{"runtime":{"ready":[],"awaitingAcceptance":[]}}});
+        let children = json!({"children":[]});
+        let initial = model_state(&snapshot, &roadmap, Some(&gate), Some(&children), None);
+        assert!(initial.unresolved);
+        roadmap["structured"]["revision"] = json!(2);
+        let mut repeated = snapshot.clone();
+        repeated["turnSerial"] = json!(90);
+        repeated["queuedInputs"] = json!(3);
+        assert_eq!(
+            model_state(&repeated, &roadmap, Some(&gate), Some(&children), None).key,
+            initial.key
+        );
+        assert_ne!(
+            model_state(
+                &snapshot,
+                &roadmap,
+                Some(&gate),
+                Some(&children),
+                Some("owned-job-finished")
+            )
+            .key,
+            initial.key
+        );
+        let mut ready = gate.clone();
+        ready["nextWork"]["runtime"]["ready"] = json!([{"stepId":"task"}]);
+        assert_ne!(
+            model_state(&snapshot, &roadmap, Some(&ready), Some(&children), None).key,
+            initial.key
+        );
+        roadmap["structured"]["steps"][0]["dependencies"] = json!([]);
+        assert_ne!(
+            model_state(&snapshot, &roadmap, Some(&gate), Some(&children), None).key,
+            initial.key
+        );
+        let mut stopped = snapshot;
+        stopped["stopped"] = json!(true);
+        assert_ne!(
+            model_state(&stopped, &roadmap, Some(&gate), Some(&children), None).key,
+            model_state(&repeated, &roadmap, Some(&gate), Some(&children), None).key
+        );
+    }
+
+    #[test]
     fn drone_notice_rearms_for_material_work_without_human_plan_or_reply_counter_noise() {
         let mut registry = DroneRegistry::default();
         registry.cooldown = std::time::Duration::ZERO;
