@@ -478,6 +478,8 @@ impl Worker {
             }
 
             let current_role = role.lock().unwrap().clone();
+            payload["nativeAssignmentTrusted"] =
+                json!(matches!(&current_role, ConnectionRole::Supervisor { .. }));
             match current_role {
                 ConnectionRole::Unauthenticated => {
                     // The first command authenticates the connection; a
@@ -581,7 +583,9 @@ impl Worker {
                 ConnectionRole::PeerWorker { ref session } => {
                     // A peer worker delivers agent messages only, for the grant's session;
                     // everything else bounces with the gate string.
-                    if !worker_peer_command_allowed(&command_type, &payload, &session.grant) {
+                    if payload.get("rootRetaskAssignment").is_some()
+                        || !worker_peer_command_allowed(&command_type, &payload, &session.grant)
+                    {
                         let failure = response_failure(
                             Some(&request_id),
                             &command_type,

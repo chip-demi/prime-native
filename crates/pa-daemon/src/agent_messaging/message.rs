@@ -207,6 +207,25 @@ impl AgentMessageController for LinkAgentMessageController {
         if input.target == self.active_session_id {
             anyhow::bail!("Agent messaging cannot target the sending session");
         }
+        if input.completion.is_some() {
+            let identity = self.family_identity();
+            anyhow::ensure!(
+                input.receiver_role == Some(AgentFamilyRelationship::Sibling)
+                    && identity.rlm_depth == 0
+                    && identity.is_top_level()
+                    && identity.session_id.is_some()
+                    && identity.session_file.is_some(),
+                "Completion requires a durable independent root creator"
+            );
+            return self
+                .deliver_via_supervisor(input)
+                .await
+                .map_err(|error| match error {
+                    DeliveryFailure::Rejected(error) | DeliveryFailure::Unknown(error) => {
+                        anyhow::anyhow!(error)
+                    }
+                });
+        }
         let admission = if let Some(children) = &self.children {
             let identities = children.child_identities().await;
             let mut admission_target = input.target.clone();
@@ -420,6 +439,7 @@ impl LinkAgentMessageController {
         &self,
         input: AgentMessageSendInput,
     ) -> Result<AgentMessageReceipt, DeliveryFailure> {
+        let expected_creator = self.family_identity();
         let response = self
             .link
             .request(
@@ -429,6 +449,11 @@ impl LinkAgentMessageController {
                     "message": input.message,
                     "fromActiveSessionId": self.active_session_id,
                     "agentOrigin": true,
+                    "completion": input.completion,
+                    "workerToken": self.worker_token,
+                    "expectedCreatorSessionId": expected_creator.session_id,
+                    "expectedCreatorSessionFile": expected_creator.session_file,
+                    "expectedTargetSessionId": input.expected_target_session_id,
                 }),
                 std::time::Duration::from_secs(30),
             )

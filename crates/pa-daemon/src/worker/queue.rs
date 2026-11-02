@@ -430,14 +430,17 @@ pub(crate) fn restore_queue_snapshot(
                 // The journal retains the custom row, including the original
                 // body. Reconstruct the marker used by clear/pause/status.
                 let agent_message = record.custom_message.as_ref().and_then(|row| {
-                    (row.get("customType").and_then(Value::as_str) == Some(AGENT_MESSAGE_SOURCE))
-                        .then(|| {
-                            row.get("details")?
-                                .get("message")?
-                                .as_str()
-                                .map(str::to_string)
-                        })
-                        .flatten()
+                    (matches!(
+                        row.get("customType").and_then(Value::as_str),
+                        Some(AGENT_MESSAGE_SOURCE | "rlm_session_assignment")
+                    ))
+                    .then(|| {
+                        row.get("details")?
+                            .get("message")?
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .flatten()
                 });
                 QueuedItem {
                     preview: record.preview,

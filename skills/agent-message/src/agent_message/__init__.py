@@ -20,8 +20,16 @@ async def send(
     *,
     receiver_role: ReceiverRole | str | None = None,
     receiver_name: str | None = None,
+    completion: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Send one direct role-addressed message or broadcast to ``"all"``."""
+    if completion is not None:
+        if broadcast_message is not None or receiver_role != "sibling":
+            raise ValueError("completion requires an explicit sibling retask")
+        if (not isinstance(completion, dict)
+            or set(completion) != {"assignment_id", "artifact_ref"}
+            or any(not isinstance(v, str) or not v.strip() for v in completion.values())):
+            raise ValueError("completion requires assignment_id and artifact_ref only")
     roles = ("parent", "sibling", "child")
     if broadcast_message is not None:
         if message != "all":
@@ -50,6 +58,8 @@ async def send(
             "receiver_role": receiver_role,
             "receiver_name": receiver_name,
         }
+    if completion is not None:
+        payload["completion"] = completion
     receipt = await host_request("agent_message.send", payload)
     receipts = receipt.get("receipts") if isinstance(receipt, dict) else None
     if isinstance(receipts, list):

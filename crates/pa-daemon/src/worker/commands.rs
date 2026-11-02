@@ -699,6 +699,10 @@ impl Worker {
             "get_state",
             Some({
                 let mut value = serde_json::to_value(&summary).unwrap_or(Value::Null);
+                value["rootRetaskCompletionVersion"] = json!(1);
+                value["rootRetaskInputFence"] = super::input::root_retask_input_fence(&core);
+                value["rootRetaskGoalFence"] =
+                    super::input::root_retask_goal_fence(self.engine.as_ref());
                 value["messageLifecycleFacts"] = json!(message_facts);
                 value["ownerCancelFacts"] = owner_cancel_facts;
                 value["ownExecutionStarted"] = json!(

@@ -80,6 +80,8 @@ pub struct AgentMessageSendInput {
     pub target: String,
     pub message: String,
     pub receiver_role: Option<AgentFamilyRelationship>,
+    pub completion: Option<Value>,
+    pub expected_target_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +404,15 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
             let controller = controller.clone();
             Box::pin(async move {
                 let data = payload.data;
+                let completion = data.get("completion").filter(|v| !v.is_null()).cloned();
+                if let Some(value) = &completion {
+                    anyhow::ensure!(data.get("target").is_none()
+                        && data["receiver_role"] == "sibling", "Completion requires an explicit sibling retask");
+                    anyhow::ensure!(value.as_object().is_some_and(|o| o.len() == 2)
+                        && ["assignment_id", "artifact_ref"].iter().all(|k|
+                            value[*k].as_str().is_some_and(|s| !s.trim().is_empty())),
+                        "completion requires assignment_id and artifact_ref only");
+                }
                 let Some(message) = data.get("message").and_then(Value::as_str) else {
                     return Err(anyhow::anyhow!(
                         "agent_message.send message must be a string"
@@ -431,6 +442,8 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                                 target: member.id.clone(),
                                 message: message.clone(),
                                 receiver_role: Some(member.relationship),
+                                completion: None,
+                                expected_target_session_id: None,
                             })
                             .await;
                         receipts.push(match result {
@@ -518,6 +531,8 @@ pub fn register_agent_message_host_handlers<C: AgentMessageController + 'static>
                         target: member.id.clone(),
                         message: message.clone(),
                         receiver_role: Some(role),
+                        expected_target_session_id: completion.as_ref().and_then(|_| member.aliases.first().cloned()),
+                        completion,
                     })
                     .await?;
                 Ok(receipt_value(&receipt))

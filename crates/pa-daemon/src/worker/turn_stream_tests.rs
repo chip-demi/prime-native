@@ -832,6 +832,37 @@ async fn session_completion_settle_duplicate_recovery_and_retask() {
             .count(),
         1
     );
+    // The same root now consumes B's reserved assignment; A cannot label B's result.
+    {
+        let mut core = runner.core.lock().unwrap();
+        let store = core.store.as_mut().unwrap();
+        store
+            .persist_entry(
+                "custom_message",
+                json!({"customType":"rlm_session_assignment", "details":{
+            "assignmentId":"task-B","artifactRef":"B.md","creatorSessionId":"creator",
+            "creatorSessionFile":"creator.jsonl","deliveryId":"delivery-B"}}),
+            )
+            .unwrap();
+        store
+            .persist_entry(
+                "message",
+                json!({"message":{"role":"assistant","stopReason":"stop","content":"B result"}}),
+            )
+            .unwrap();
+    }
+    runner.record_session_settlement();
+    runner.deliver_session_completion().await;
+    runner.deliver_session_completion().await;
+    let commands = commands.lock().unwrap();
+    let sends: Vec<_> = commands
+        .iter()
+        .filter(|row| row["type"] == "follow_up")
+        .collect();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[1]["queueKey"], "delivery-B");
+    let text = sends[1]["message"].as_str().unwrap();
+    assert!(text.contains("task-B") && text.contains("B.md") && text.contains("B result"));
     server.abort();
 }
 

@@ -503,7 +503,12 @@ impl SupervisorChildSessionsInner {
                 admission_id: None,
                 rlm_notice_nonce: None,
             },
-            rest: Map::default(),
+            rest: if custom_message.is_some_and(|row| row["customType"] == "rlm_session_assignment")
+            {
+                Map::from_iter([("workerToken".into(), json!(self.worker_token))])
+            } else {
+                Map::default()
+            },
         };
         self.command_with_durable_wake(
             make_command,

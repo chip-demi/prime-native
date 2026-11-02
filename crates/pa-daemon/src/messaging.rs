@@ -33,6 +33,7 @@ impl Supervisor {
             message,
             from_active_session_id,
             delivery_mode,
+            rest,
             ..
         } = command
         else {
@@ -111,13 +112,91 @@ impl Supervisor {
             // the client id (`createAgentSessionMessageSender`).
             None => json!({ "clientId": client_id }),
         };
+        let mut delivery_rest = Map::default();
+        if let Some(completion) = rest.get("completion").filter(|v| !v.is_null()) {
+            let source = match &source {
+                Some(source) => source,
+                None => return fail("Completion requires an independent root creator".into()),
+            };
+            let authenticated = match rest.get("workerToken").and_then(Value::as_str) {
+                Some(token) => self
+                    .registry
+                    .find_by_token(token)
+                    .await
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, source)),
+                None => false,
+            };
+            if !authenticated {
+                return fail("Root retask creator authentication failed; not dispatched".into());
+            }
+            let creator = match self.source_worker_summary(source).await {
+                Ok(value) => value,
+                Err(error) => return fail(format!("{error:#}")),
+            };
+            let receiver = match self.source_worker_summary(&target).await {
+                Ok(value) => value,
+                Err(error) => return fail(format!("{error:#}")),
+            };
+            let refreshed_creator = match self.source_worker_summary(source).await {
+                Ok(value) => value,
+                Err(error) => return fail(format!("{error:#}")),
+            };
+            if creator["sessionId"] != refreshed_creator["sessionId"]
+                || creator["sessionFile"] != refreshed_creator["sessionFile"]
+                || creator["rootRetaskGoalFence"] != refreshed_creator["rootRetaskGoalFence"]
+                || creator["rootRetaskInputFence"] != refreshed_creator["rootRetaskInputFence"]
+            {
+                return fail("Root retask creator task changed; not dispatched".into());
+            }
+            let root = |value: &Value| {
+                value["rlmDepth"] == 0
+                    && ["parentActiveSessionId", "parentSessionId"]
+                        .iter()
+                        .all(|key| value[*key].as_str().is_none_or(str::is_empty))
+            };
+            let durable = |value: &Value| {
+                ["sessionId", "sessionFile"]
+                    .iter()
+                    .all(|key| value[*key].as_str().is_some_and(|s| !s.is_empty()))
+            };
+            if creator["sessionId"] != rest["expectedCreatorSessionId"]
+                || creator["sessionFile"] != rest["expectedCreatorSessionFile"]
+                || receiver["sessionId"] != rest["expectedTargetSessionId"]
+                || !root(&creator)
+                || !root(&receiver)
+                || !durable(&creator)
+                || !durable(&receiver)
+                || receiver["rootRetaskCompletionVersion"] != 1
+                || !completion.as_object().is_some_and(|o| o.len() == 2)
+                || !["assignment_id", "artifact_ref"].iter().all(|key| {
+                    completion[*key]
+                        .as_str()
+                        .is_some_and(|s| !s.trim().is_empty())
+                })
+            {
+                return fail(
+                    "Root retask completion unsupported or identity unavailable; not dispatched"
+                        .into(),
+                );
+            }
+            delivery_rest.insert("rootRetaskAssignment".into(), json!({
+                "assignmentId":completion["assignment_id"], "artifactRef":completion["artifact_ref"],
+                "creatorSessionId":creator["sessionId"], "creatorSessionFile":creator["sessionFile"],
+                "creatorActiveSessionId":creator["activeSessionId"],
+                "targetSessionId":receiver["sessionId"], "targetSessionFile":receiver["sessionFile"],
+                "targetActiveSessionId":receiver["activeSessionId"],
+                "inputFence":receiver["rootRetaskInputFence"],
+                "goalFence":receiver["rootRetaskGoalFence"],
+                "deliveryId":uuid::Uuid::new_v4().to_string()
+            }));
+        }
         let delivery = DaemonWorkerCommand::WorkerDeliverMessage {
             id: None,
             target_active_session_id: target.worker_id.clone(),
             message: message.clone(),
             sender,
             delivery_mode: delivery_mode.clone(),
-            rest: Map::default(),
+            rest: delivery_rest,
         };
         let payload = match serde_json::to_value(&delivery) {
             Ok(payload) => payload,
@@ -141,7 +220,9 @@ impl Supervisor {
                     .error
                     .unwrap_or_else(|| "delivery failed".to_string()),
             ),
-            Err(error) => fail(format!("{error:#}")),
+            Err(error) => fail(format!(
+                "Agent message delivery UNKNOWN; do not resend: {error:#}"
+            )),
         }
     }
 

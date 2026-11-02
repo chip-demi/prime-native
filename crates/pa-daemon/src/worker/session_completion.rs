@@ -103,7 +103,9 @@ impl TurnRunner {
             let assignment = durable.entries[index].fields["details"].clone();
             let tail = &durable.entries[index + 1..];
             if tail.iter().any(|row| {
-                (row.type_ == "message" && row.fields["message"]["role"] == "user")
+                (row.type_ == "custom"
+                    && row.fields["customType"] == "rlm_session_retask_admission")
+                    || (row.type_ == "message" && row.fields["message"]["role"] == "user")
                     || (row.type_ == "custom_message"
                         && row.fields["customType"] == "agent_message")
             }) {

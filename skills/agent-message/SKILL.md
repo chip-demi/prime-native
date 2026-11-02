@@ -26,6 +26,15 @@ if child is not None:
 
 ## API
 
+For an explicit new assignment to an existing independent root, opt in with
+`await agent_message.send("task", receiver_role="sibling", receiver_name="worker", completion={"assignment_id":"task-B", "artifact_ref":"result-B.md"})`.
+The durable creator receives a settled-result notice, not task acceptance.
+Unsupported capability rejects before dispatch; no silent plain-send fallback.
+Rejected input preserves the previous subscription; accepted input replaces it.
+UNKNOWN must be reconciled by receipt lookup, never by resending the assignment.
+This does not resume owner stop or grant execution authority. Broadcasts and
+non-root targets cannot request completion. Plain sends remain unchanged.
+
 - `await agent_observe.list_agents()` (agent-observe skill) is the roster: it
   lists the parent, siblings, and children this skill can reach, active or not,
   with the `relationship` and `sessionName` that `send` takes as
