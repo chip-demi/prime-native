@@ -10,6 +10,17 @@ use super::{
     DAEMON_SCHEMA_REVISION, DEFAULT_PRIVATE_FRAME_LIMITS, PEER_COMMAND_NOT_ALLOWED,
 };
 
+pub(super) fn stamp_assignment_trust(
+    command_type: &str,
+    payload: &mut Value,
+    role: &ConnectionRole,
+) {
+    if matches!(command_type, "prompt" | "prompt_and_wait") {
+        payload["nativeAssignmentTrusted"] =
+            json!(matches!(role, ConnectionRole::Supervisor { .. }));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthOutcome {
     Authenticated,
@@ -478,8 +489,7 @@ impl Worker {
             }
 
             let current_role = role.lock().unwrap().clone();
-            payload["nativeAssignmentTrusted"] =
-                json!(matches!(&current_role, ConnectionRole::Supervisor { .. }));
+            stamp_assignment_trust(&command_type, &mut payload, &current_role);
             match current_role {
                 ConnectionRole::Unauthenticated => {
                     // The first command authenticates the connection; a
