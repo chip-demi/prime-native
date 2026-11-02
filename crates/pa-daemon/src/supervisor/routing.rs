@@ -325,6 +325,31 @@ impl Supervisor {
         // itself; `None` (supervisor-internal callers) forces the typed path.
         raw_out: Option<&tokio::sync::mpsc::Sender<(Vec<Outbound>, bool)>>,
     ) -> (Vec<Value>, bool) {
+        if let DaemonCommand::Prompt { input, rest, .. }
+        | DaemonCommand::PromptAndWait { input, rest, .. } = command
+        {
+            if input
+                .custom_message
+                .as_ref()
+                .is_some_and(|row| row["customType"] == "rlm_session_assignment")
+            {
+                let authenticated = match rest.get("workerToken").and_then(Value::as_str) {
+                    Some(token) => self.registry.find_by_token(token).await.is_some(),
+                    None => false,
+                };
+                if !authenticated {
+                    return (
+                        vec![response_line(&response_failure(
+                            Some(&command_id),
+                            &type_name,
+                            "Reserved session assignment provenance",
+                            None,
+                        ))],
+                        false,
+                    );
+                }
+            }
+        }
         if let DaemonCommand::ConfigureOrchestrationGate {
             active_session_id,
             rest,

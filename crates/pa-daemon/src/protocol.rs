@@ -363,6 +363,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "heartbeat_management",
                 "native_thread_heartbeat_v1",
                 "native_input_correlation_v1",
+                "root_retask_completion_v1",
                 "native_goal_controls_v1",
                 "recoverable_session_control_v1",
                 "scoped_live_input_v1",

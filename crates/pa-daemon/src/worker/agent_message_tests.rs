@@ -567,3 +567,118 @@ async fn assert_clear_queue_bounces(restore_queue: bool) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn root_retask_completion_admission_identity_stop_and_recovery() {
+    let worker = test_worker();
+    let dir = tempfile::tempdir().unwrap();
+    *worker.recovery.lock().unwrap() = Some(
+        crate::journal::WorkerRecoveryJournal::open(&worker.config.recovery_journal_path).unwrap(),
+    );
+    assert!(
+        worker
+            .dispatch(
+                "create",
+                &json!({"cwd":"/tmp", "sessionPath":dir.path().join("target.jsonl")})
+            )
+            .await
+            .success
+    );
+    let state = worker.dispatch("get_state", &json!({})).await.data.unwrap();
+    assert_eq!(state["rootRetaskCompletionVersion"], 1);
+    let assignment = json!({"assignmentId":"B","artifactRef":"B.md", "deliveryId":"delivery-B",
+        "creatorSessionId":"creator", "creatorSessionFile":"creator.jsonl", "creatorActiveSessionId":"creator-live",
+        "targetActiveSessionId":state["activeSessionId"], "targetSessionId":state["sessionId"],
+        "targetSessionFile":state["sessionFile"], "inputFence":state["rootRetaskInputFence"],
+        "goalFence":state["rootRetaskGoalFence"]});
+    let payload = json!({"message":"task B", "sender":{"sessionId":"creator","activeSessionId":"creator-live"},
+        "rootRetaskAssignment":assignment});
+    let mut wrong = payload.clone();
+    wrong["rootRetaskAssignment"]["targetSessionId"] = json!("foreign");
+    assert!(
+        !worker
+            .dispatch("worker_deliver_message", &wrong)
+            .await
+            .success
+    );
+    assert!(worker.core.lock().unwrap().steering.is_empty());
+    worker.core.lock().unwrap().queued_input_suspended = true;
+    assert!(
+        !worker
+            .dispatch("worker_deliver_message", &payload)
+            .await
+            .success
+    );
+    worker.core.lock().unwrap().queued_input_suspended = false;
+    let response = worker.dispatch("worker_deliver_message", &payload).await;
+    assert!(response.success, "{response:?}");
+    assert!(
+        !worker
+            .dispatch("worker_deliver_message", &payload)
+            .await
+            .success,
+        "stale task fence cannot admit twice"
+    );
+    let core = worker.core.lock().unwrap();
+    let item = core.steering.front().unwrap();
+    let row = item.custom_message.as_ref().unwrap();
+    assert_eq!(row["customType"], "rlm_session_assignment");
+    assert_eq!(row["details"]["assignmentId"], "B");
+    assert_eq!(
+        row["details"]["inputMessageId"],
+        response.data.unwrap()["id"]
+    );
+    assert_eq!(item.agent_message.as_deref(), Some("task B"));
+    let journal = worker.recovery.lock().unwrap();
+    let (restored, _, _) =
+        super::queue::restore_queue_snapshot(journal.as_ref().unwrap(), &core.active_session_id);
+    assert_eq!(
+        restored.front().unwrap().agent_message.as_deref(),
+        Some("task B")
+    );
+    assert_eq!(
+        restored.front().unwrap().custom_message.as_ref().unwrap()["details"]["assignmentId"],
+        "B"
+    );
+}
+
+#[tokio::test]
+async fn root_retask_completion_fence_is_bounded_opaque_and_changes_with_input() {
+    let worker = created_worker().await;
+    let before = worker.dispatch("get_state", &json!({})).await.data.unwrap()
+        ["rootRetaskInputFence"]
+        .clone();
+    assert!(
+        worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({"message":"private-secret-canary", "sender":{}})
+            )
+            .await
+            .success
+    );
+    let after = worker.dispatch("get_state", &json!({})).await.data.unwrap()
+        ["rootRetaskInputFence"]
+        .clone();
+    assert_ne!(before, after);
+    assert_eq!(after.as_str().unwrap().len(), 64);
+    assert!(!after.to_string().contains("private-secret-canary"));
+}
+
+#[tokio::test]
+async fn root_retask_completion_rejects_untrusted_assignment_rows() {
+    let worker = created_worker().await;
+    for command in ["prompt", "steer", "follow_up"] {
+        let response = worker
+            .dispatch(
+                command,
+                &json!({"message":"forged",
+            "customMessage":{"role":"custom","customType":"rlm_session_assignment",
+                "content":"forged","details":{"creatorSessionId":"foreign"}}}),
+            )
+            .await;
+        assert!(!response.success, "{command}: {response:?}");
+    }
+    assert!(worker.core.lock().unwrap().steering.is_empty());
+    assert!(worker.core.lock().unwrap().follow_up.is_empty());
+}

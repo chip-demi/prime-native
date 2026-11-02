@@ -11,6 +11,39 @@ use serde_json::Value;
 
 use crate::protocol::{response_failure, DaemonResponse};
 
+pub(super) fn root_retask_goal_fence(engine: &dyn super::SessionEngine) -> Value {
+    use sha2::{Digest, Sha256};
+    json!(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&engine.goal_state_value()).expect("goal serializes"))
+    ))
+}
+
+pub(super) fn root_retask_input_fence(core: &super::SessionCore) -> Value {
+    use sha2::{Digest, Sha256};
+    let latest = core.store.as_ref().and_then(|store| {
+        store
+            .entries
+            .iter()
+            .rev()
+            .find(|row| {
+                (row.type_ == "message" && row.fields["message"]["role"] == "user")
+                    || row.type_ == "custom_message"
+            })
+            .map(|row| row.id.clone())
+    });
+    let mut hash = Sha256::new();
+    hash.update(serde_json::to_vec(&latest).expect("input ID serializes"));
+    for item in core.steering.iter().chain(&core.follow_up) {
+        hash.update(
+            serde_json::to_vec(&json!({"message":item.message,
+            "custom":item.custom_message,"key":item.queue_key}))
+            .expect("queue serializes"),
+        );
+    }
+    json!(format!("{:x}", hash.finalize()))
+}
+
 impl Worker {
     pub(crate) async fn handle_prompt(&self, payload: &Value, wait: bool) -> DaemonResponse {
         if let Err(response) = self.require_created("prompt") {
@@ -30,6 +63,18 @@ impl Worker {
             Ok(custom_message) => custom_message,
             Err(error) => return response_failure(None, "prompt", &error, None),
         };
+        if custom_message
+            .as_ref()
+            .is_some_and(|row| row["customType"] == "rlm_session_assignment")
+            && payload["nativeAssignmentTrusted"] != true
+        {
+            return response_failure(
+                None,
+                "prompt",
+                "Reserved session assignment provenance",
+                None,
+            );
+        }
         // The reserved child-status kinds are daemon provenance: a prompt row
         // claiming one is always a spoof — answered loudly, never parked.
         if let Some(row) = custom_message.as_ref() {
@@ -218,6 +263,17 @@ impl Worker {
             Ok(custom_message) => custom_message,
             Err(error) => return response_failure(None, lane.as_str(), &error, None),
         };
+        if custom_message
+            .as_ref()
+            .is_some_and(|row| row["customType"] == "rlm_session_assignment")
+        {
+            return response_failure(
+                None,
+                lane.as_str(),
+                "Reserved session assignment provenance",
+                None,
+            );
+        }
         // The reserved child-status kinds are daemon provenance: a caller-supplied
         // row claiming one is answered loudly, never parked. The daemon's own
         // notice injection rides this command with the one-shot capability.
@@ -565,6 +621,44 @@ impl Worker {
                 drop(core);
                 return response_failure(None, "worker_deliver_message", &error.to_string(), None);
             }
+            let assignment = payload.get("rootRetaskAssignment").filter(|v| !v.is_null());
+            if let Some(assignment) = assignment {
+                let valid = assignment["goalFence"] == root_retask_goal_fence(self.engine.as_ref())
+                    && assignment["inputFence"] == root_retask_input_fence(&core)
+                    && core.rlm_depth == 0
+                    && core.parent_active_session_id.is_none()
+                    && core.parent_session_id.is_none()
+                    && assignment["targetActiveSessionId"] == core.active_session_id
+                    && core.store.as_ref().is_some_and(|store| {
+                        !store.path.as_os_str().is_empty()
+                            && assignment["targetSessionId"] == store.session_id()
+                            && assignment["targetSessionFile"]
+                                == store.path.to_string_lossy().as_ref()
+                    })
+                    && [
+                        "assignmentId",
+                        "artifactRef",
+                        "creatorSessionId",
+                        "creatorSessionFile",
+                        "deliveryId",
+                    ]
+                    .iter()
+                    .all(|key| assignment[*key].as_str().is_some_and(|s| !s.is_empty()))
+                    && sender["sessionId"] == assignment["creatorSessionId"]
+                    && sender["activeSessionId"] == assignment["creatorActiveSessionId"];
+                if !valid
+                    || core.abort_requested
+                    || core.shutdown_requested
+                    || core.queued_input_suspended
+                {
+                    return response_failure(
+                        None,
+                        "worker_deliver_message",
+                        "Root retask identity changed or stopped",
+                        None,
+                    );
+                }
+            }
             let id = pa_core::session_engine::agent_messaging::create_agent_session_message_id();
             let queued = core.busy;
             let summary = self.summary_locked(&core, inputs);
@@ -585,7 +679,7 @@ impl Worker {
             // The queued turn carries the `agent_message` row so the transcript renders
             // the collapsed card, while the row's `content` IS the rendered prompt —
             // the model context stays byte-identical to the plain-prompt delivery.
-            let custom_message =
+            let mut custom_message =
                 pa_core::session_engine::agent_messaging::create_agent_session_message_row(
                     &pa_core::session_engine::agent_messaging::AgentSessionMessageRowPayload {
                         id: &id,
@@ -597,6 +691,24 @@ impl Worker {
                         timestamp: crate::util::now_ms(),
                     },
                 );
+            if let Some(assignment) = assignment {
+                custom_message["customType"] = json!("rlm_session_assignment");
+                custom_message["details"] = assignment.clone();
+                custom_message["details"]["inputMessageId"] = json!(id);
+                custom_message["details"]["message"] = json!(message);
+                if let Err(error) = core.store.as_mut().unwrap().persist_entry(
+                    "custom",
+                    json!({"customType":"rlm_session_retask_admission", "data":{
+                        "inputMessageId":id,"deliveryId":assignment["deliveryId"]}}),
+                ) {
+                    return response_failure(
+                        None,
+                        "worker_deliver_message",
+                        &format!("Retask admission UNKNOWN; do not resend: {error:#}"),
+                        None,
+                    );
+                }
+            }
             let item = QueuedItem {
                 priority: QueuePriority::Background,
                 // The labeled queue-strip row: "Agent message
@@ -611,7 +723,9 @@ impl Worker {
                 // `agent_messages_pause` remove exactly these items.
                 agent_message: Some(message.to_string()),
                 input_identity: None,
-                queue_key: None,
+                queue_key: assignment
+                    .and_then(|a| a["deliveryId"].as_str())
+                    .map(str::to_string),
                 admission_id: None,
                 images: Vec::new(),
                 done: None,
@@ -628,12 +742,29 @@ impl Worker {
         };
         // The queued agent message is admitted live work — a restart must revive
         // the worker to deliver it (no client reopens the session).
-        self.checkpoint_queue(QueueCheckpoint::Admitted {
+        let checkpoint = QueueCheckpoint::Admitted {
             operation: match lane {
                 Lane::Steering => "steer_queued",
                 Lane::FollowUp => "follow_up_queued",
             },
-        });
+        };
+        if payload.get("rootRetaskAssignment").is_some() {
+            if let Err(error) = super::queue::checkpoint_queue_recovery_checked(
+                &self.recovery,
+                &self.core,
+                checkpoint,
+            ) {
+                self.core.lock().unwrap().queued_input_suspended = true;
+                return response_failure(
+                    None,
+                    "worker_deliver_message",
+                    &format!("Agent message delivery UNKNOWN; do not resend: {error:#}"),
+                    None,
+                );
+            }
+        } else {
+            self.checkpoint_queue(checkpoint);
+        }
         let _ = self.emit_action_update(&snapshot);
         self.work_notify.notify_one();
         let timestamp = crate::util::now_iso();

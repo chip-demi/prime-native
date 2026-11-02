@@ -10,6 +10,17 @@ use super::{
     DAEMON_SCHEMA_REVISION, DEFAULT_PRIVATE_FRAME_LIMITS, PEER_COMMAND_NOT_ALLOWED,
 };
 
+pub(super) fn stamp_assignment_trust(
+    command_type: &str,
+    payload: &mut Value,
+    role: &ConnectionRole,
+) {
+    if matches!(command_type, "prompt" | "prompt_and_wait") {
+        payload["nativeAssignmentTrusted"] =
+            json!(matches!(role, ConnectionRole::Supervisor { .. }));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthOutcome {
     Authenticated,
@@ -478,6 +489,7 @@ impl Worker {
             }
 
             let current_role = role.lock().unwrap().clone();
+            stamp_assignment_trust(&command_type, &mut payload, &current_role);
             match current_role {
                 ConnectionRole::Unauthenticated => {
                     // The first command authenticates the connection; a
@@ -581,7 +593,9 @@ impl Worker {
                 ConnectionRole::PeerWorker { ref session } => {
                     // A peer worker delivers agent messages only, for the grant's session;
                     // everything else bounces with the gate string.
-                    if !worker_peer_command_allowed(&command_type, &payload, &session.grant) {
+                    if payload.get("rootRetaskAssignment").is_some()
+                        || !worker_peer_command_allowed(&command_type, &payload, &session.grant)
+                    {
                         let failure = response_failure(
                             Some(&request_id),
                             &command_type,

@@ -592,3 +592,29 @@ async fn observe_recent_returns_the_ts_envelope() {
     assert_eq!(response["truncated"], true);
     assert_eq!(response["messages"].as_array().map(Vec::len), Some(3));
 }
+
+#[test]
+fn root_retask_completion_invalid_scope_never_reads_family_or_dispatches() {
+    struct NoDispatch;
+    impl AgentMessageController for NoDispatch {
+        async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
+            panic!("family read");
+        }
+        async fn send_agent_message(
+            &self,
+            _: AgentMessageSendInput,
+        ) -> anyhow::Result<AgentMessageReceipt> {
+            panic!("dispatch");
+        }
+    }
+    let mut handlers = HostRequestHandlers::default();
+    register_agent_message_host_handlers(std::sync::Arc::new(NoDispatch), &mut handlers);
+    let send = handlers.get("agent_message.send").unwrap();
+    for payload in [
+        json!({"target":"all","message":"task","completion":{"assignment_id":"B","artifact_ref":"B.md"}}),
+        json!({"receiver_role":"child","receiver_name":"x","message":"task","completion":{"assignment_id":"B","artifact_ref":"B.md"}}),
+        json!({"receiver_role":"sibling","receiver_name":"x","message":"task","completion":{"assignment_id":"B","artifact_ref":"B.md","creator":"forged"}}),
+    ] {
+        assert!(send_request(send, payload).is_err());
+    }
+}

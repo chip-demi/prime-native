@@ -28,12 +28,21 @@ struct LinkClient {
     reader: BufReader<Box<dyn AsyncReadHalf>>,
     writer: Box<dyn AsyncWriteHalf>,
     next_id: u64,
+    server_capabilities: Value,
 }
 
 impl LinkClient {
     /// Send one command envelope and read the line that answers its id (broadcast lines
     /// are skipped); a write failure is tagged [`LinkWriteFailed`].
     async fn request(&mut self, command: Value, timeout: Duration) -> Result<DaemonResponse> {
+        if command["type"] == "send_message" && !command["completion"].is_null() {
+            anyhow::ensure!(
+                self.server_capabilities
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == "root_retask_completion_v1")),
+                "Root retask completion unsupported; not dispatched"
+            );
+        }
         let id = format!("link-{}", self.next_id);
         self.next_id += 1;
         let envelope = json!({
@@ -104,7 +113,10 @@ impl SupervisorLink {
         tokio::time::timeout_at(deadline, async {
             let mut client = self.connect().await?;
             match client.request(command.clone(), timeout).await {
-                Err(error) if error.downcast_ref::<LinkWriteFailed>().is_some() => {
+                Err(error)
+                    if command["completion"].is_null()
+                        && error.downcast_ref::<LinkWriteFailed>().is_some() =>
+                {
                     self.connect().await?.request(command, timeout).await
                 }
                 outcome => outcome,
@@ -124,6 +136,7 @@ impl SupervisorLink {
             reader: BufReader::new(reader),
             writer,
             next_id: 0,
+            server_capabilities: Value::Null,
         };
         let mut line = String::new();
         client
@@ -136,6 +149,7 @@ impl SupervisorLink {
         if hello.get("type").and_then(Value::as_str) != Some("daemon_hello") {
             return Err(anyhow!("supervisor link handshake failed"));
         }
+        client.server_capabilities = hello["serverCapabilities"].clone();
         Ok(client)
     }
 
@@ -162,6 +176,29 @@ impl SupervisorLink {
 mod tests {
     use super::*;
     use crate::protocol::{response_line, response_success};
+
+    #[tokio::test]
+    async fn root_retask_completion_unsupported_supervisor_receives_no_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sup.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"{\"type\":\"daemon_hello\"}\n")
+                .await
+                .unwrap();
+            let mut line = String::new();
+            assert_eq!(
+                BufReader::new(stream).read_line(&mut line).await.unwrap(),
+                0
+            );
+        });
+        let link = SupervisorLink::new(socket);
+        let result = link.request(json!({"type":"send_message", "completion":{"assignment_id":"B","artifact_ref":"B.md"}}), Duration::from_secs(2)).await;
+        assert!(result.unwrap_err().to_string().contains("not dispatched"));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn long_request_does_not_block_roster_or_message_on_the_same_link() {

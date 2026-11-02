@@ -207,6 +207,45 @@ mod owner_bootstrap_tests {
         json!({"version":1,"generation":"g","instance":"i","worker":"w","sequence":sequence,"payload":payload,"macHex":format!("{:x}", mac.finalize().into_bytes())})
     }
     #[test]
+    fn owner_bootstrap_connection_preserves_strict_signed_proof() {
+        let mut valid = proof(1, r#"{"operation":"owner_bootstrap_preflight"}"#);
+        let original = valid.clone();
+        super::super::connection::stamp_assignment_trust(
+            "private_owner_bootstrap",
+            &mut valid,
+            &super::super::ConnectionRole::Supervisor {
+                generation: "g".into(),
+            },
+        );
+        assert_eq!(valid, original);
+        assert!(owner().verify(&valid).is_ok());
+        valid["nativeAssignmentTrusted"] = json!(true);
+        assert!(owner().verify(&valid).is_err());
+    }
+
+    #[test]
+    fn assignment_trust_is_overwritten_only_for_prompt_commands() {
+        use super::super::ConnectionRole;
+        for command in ["prompt", "prompt_and_wait"] {
+            let mut spoof = json!({"nativeAssignmentTrusted":true});
+            super::super::connection::stamp_assignment_trust(
+                command,
+                &mut spoof,
+                &ConnectionRole::Unauthenticated,
+            );
+            assert_eq!(spoof["nativeAssignmentTrusted"], false);
+            super::super::connection::stamp_assignment_trust(
+                command,
+                &mut spoof,
+                &ConnectionRole::Supervisor {
+                    generation: "g".into(),
+                },
+            );
+            assert_eq!(spoof["nativeAssignmentTrusted"], true);
+        }
+    }
+
+    #[test]
     fn owner_bootstrap_mac_targets_generation_instance_sequence_and_exact_payload() {
         let mut verifier = owner();
         let valid = proof(1, r#"{"operation":"owner_bootstrap_preflight"}"#);

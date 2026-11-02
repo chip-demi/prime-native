@@ -1,0 +1,1 @@
+- Add opt-in settled-result notifications for explicit retasks of existing independent root sessions, preserving stop and uncertain-delivery handling.
